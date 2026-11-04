@@ -1,0 +1,12 @@
+pandas
+numpy
+streamlit>=1.50
+anthropic
+feedparser
+yfinance
+requests
+python-dotenv
+pytest
+# vnstock (bản 5) cài riêng: xem README, mục "Dữ liệu giá"
+watchdog
+openpyxl

@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+data/cache/
+data/*.db
+data/portfolio.json
+data/settings.json

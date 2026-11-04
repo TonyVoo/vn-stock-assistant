@@ -1,0 +1,13 @@
+# Giao diện tối cố định, phong cách Linear/Simplize.
+[theme]
+base = "dark"
+primaryColor = "#5E6AD2"
+backgroundColor = "#0A0B0D"
+secondaryBackgroundColor = "#101114"
+textColor = "#F2F3F5"
+borderColor = "#1D2026"
+baseRadius = "0.5rem"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
