@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from src import explain, risk, settings, ui
+from src import explain, portfolio, precheck, risk, settings, ui
 from views import shared
 
 LIMIT_TEXT = {"rủi ro": "mua thêm sẽ vượt mức mất tối đa bạn chấp nhận",
@@ -16,6 +16,44 @@ def _save_safety() -> None:
     st.session_state["risk_pct"] = st.session_state["w_risk"]
     st.session_state["max_alloc"] = st.session_state["w_alloc"]
     settings.save(shared.current_settings())
+
+
+def _price(sym: str):
+    try:
+        df, _ = shared.load(sym)
+        return float(df["close"].iloc[-1]) if df is not None and len(df) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _traffic_light(ctx, entry, stop, target, recommended: int) -> None:
+    """Đèn giao thông cho số cổ phiếu bạn THỰC SỰ định mua (mặc định là mức app tính)."""
+    ui.section("Kiểm tra trước khi mua", "Đối chiếu với quy tắc an toàn của chính bạn")
+    shares = int(st.number_input("Số cổ phiếu bạn định mua", 100, 10_000_000, int(recommended), 100, key=f"calc_plan_{recommended}",
+                                 help="Mặc định là số tối đa app tính. Nhập số bạn thực sự định mua để kiểm tra."))
+    pf = portfolio.load()
+    sym = (st.session_state.get("calc_symbol") or "").upper()
+    existing, total, cash = 0.0, ctx.capital, None
+    if pf["holdings"] or pf["cash"] > 0:
+        df, s = portfolio.valuate(pf, _price, st.session_state["max_alloc"] / 100)
+        cash = pf["cash"]  # tổng tài sản vẫn lấy theo vốn ở Cài đặt, cùng cơ sở với số cổ phiếu app vừa tính ở trên
+        if sym and len(df):
+            existing = float(df.loc[df["symbol"] == sym, "value"].sum())
+    avg_value = None
+    if sym:
+        d, _ = shared.load(sym)
+        if d is not None and len(d) >= 5 and "volume" in d:
+            avg_value = float((d["close"] * d["volume"]).tail(20).mean())
+    r = precheck.check(entry, stop, target, shares, total, cash, existing, st.session_state["risk_pct"] / 100,
+                       st.session_state["max_alloc"] / 100, avg_value)
+    title, sub = precheck.TITLE[r["level"]]
+    ui.callout(sub, {"ok": "good", "warn": "warn", "bad": "bad"}[r["level"]], title)
+    rows = "".join(f'<div class="item"><div>{ui.badge({"ok": "Ổn", "warn": "Cân nhắc", "bad": "Vi phạm"}[i["level"]], {"ok": "up", "warn": "flat", "bad": "down"}[i["level"]])} '
+                   f'<b>{ui.esc(i["label"])}</b></div><div class="d">{ui.esc(i["text"])}</div></div>' for i in r["items"])
+    st.markdown(f'<div class="card">{rows}</div>', unsafe_allow_html=True)
+    st.caption(f"Các tỷ lệ % tính theo vốn {explain.money_short(ctx.capital)} ở Cài đặt; tiền mặt lấy từ Danh mục.")
+    if not sym:
+        st.caption("Chưa biết mã cổ phiếu nên chưa kiểm tra được thanh khoản và tỷ trọng của chính mã này. Mở trang này từ trang Tra cứu để kiểm tra đầy đủ hơn.")
 
 
 def render(ctx) -> None:
@@ -80,6 +118,7 @@ def render(ctx) -> None:
                     f'<span class="hint">Người đầu tư kỷ luật thường chỉ vào lệnh khi lãi tiềm năng ≥ 2 lần lỗ tiềm năng.</span></div>'
                     f'{ui.kv_rows([("Giá phải đạt để hòa vốn (sau phí, thuế)", explain.vnd(res["breakeven"])), ("Không mua nhiều hơn vì", LIMIT_TEXT.get(res["limited_by"], res["limited_by"]))])}'
                     f'</div>', unsafe_allow_html=True)
+        _traffic_light(ctx, entry, stop, target, res["shares"])
         lim = risk.price_limits(entry, "HOSE")
         st.caption(f"Cần biết: mua hôm nay thì 2 ngày làm việc sau mới bán được (quy định T+2). "
                    f"Trong một ngày, giá sàn HOSE chỉ được biến động trong khoảng {explain.vnd(lim['floor'])} – {explain.vnd(lim['ceiling'])} "

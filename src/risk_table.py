@@ -26,10 +26,12 @@ def _stop_info(symbol: str, qty: float, open_trades: Optional[pd.DataFrame]) -> 
     return stop, min(float(qty), total_q)
 
 
-def build(valuation: pd.DataFrame, open_trades: Optional[pd.DataFrame], cash: float, risk_pct: float = 2.0) -> Tuple[pd.DataFrame, Dict]:
-    """risk_pct: mức % tài sản bạn chấp nhận mất cho MỖI mã (cài đặt “Chấp nhận mất tối đa”)."""
+def build(valuation: pd.DataFrame, open_trades: Optional[pd.DataFrame], cash: float, risk_pct: float = 2.0, capital: float = 0.0) -> Tuple[pd.DataFrame, Dict]:
+    """risk_pct: mức % tài sản bạn chấp nhận mất cho MỖI mã (cài đặt “Chấp nhận mất tối đa”).
+    capital: vốn bạn đặt ở Cài đặt; tỷ lệ % tính trên max(cổ phiếu + tiền mặt đã ghi, capital), phần chưa ghi coi là tiền chưa đầu tư."""
     stock_value = float(valuation["value"].sum()) if len(valuation) else 0.0
-    total = stock_value + float(cash)
+    total = max(stock_value + float(cash), float(capital or 0.0))
+    cash = total - stock_value  # tiền mặt hiệu dụng: đã ghi + phần chưa đầu tư
     rows = []
     for r in valuation.itertuples():
         price = float(r.price) if r.price else 0.0

@@ -10,8 +10,8 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from src import broker_tcbs, cashflow, explain, importer, journal, portfolio, risk_table, ui
-from views import shared
+from src import benchmark, broker_tcbs, inbox as inbox_mod, cashflow, dividends, explain, importer, journal, portfolio, risk_table, ui
+from views import holdings_news, shared
 
 SOURCE_LABEL = {"manual": "nhập tay", "import": "nhập từ file", "journal": "từ nhật ký giao dịch", "tcbs": "TCBS (chỉ đọc)"}
 PALETTE = ["#5E6AD2", "#3DD68C", "#E5B64A", "#F2555A", "#8C99F2", "#4FB3D9", "#B47EDB", "#E08A4B", "#7A8AA0", "#2FA37A"]
@@ -139,7 +139,7 @@ def _risk_section(df: pd.DataFrame, s: dict, pf: dict) -> None:
     t = journal.list_trades()
     open_t = t[t["exit_price"].isna()] if not t.empty else None
     risk_pct = float(st.session_state.get("risk_pct", 2.0))
-    rt, rs = risk_table.build(df, open_t, pf["cash"], risk_pct)
+    rt, rs = risk_table.build(df, open_t, pf["cash"], risk_pct, float(st.session_state.get("capital_m", 0.0)) * 1_000_000)
     label, level, text = rs["verdict"]
     ui.callout(text, {"bad": "bad", "warn": "warn", "ok": "good"}.get(level, "info"), f"Đánh giá nhanh: {label}")
     c1, c2, c3, c4 = st.columns(4)
@@ -181,6 +181,103 @@ def _risk_section(df: pd.DataFrame, s: dict, pf: dict) -> None:
                  hide_index=True, width="stretch")
 
 
+def _benchmark_section(value_now: float) -> None:
+    """So sánh với VN-Index: nếu cùng các khoản nạp/rút được bỏ vào chỉ số vào đúng ngày thì giờ có bao nhiêu."""
+    ui.section("So với VN-Index", "Nếu bạn bỏ cùng số tiền, cùng ngày vào chỉ số thì bây giờ được bao nhiêu")
+    idx, _ = shared.load_long("VNINDEX")
+    r = benchmark.compare(cashflow.list_flows(), value_now, idx)
+    if not r["ok"]:
+        ui.callout(r["reason"], "info")
+        return
+    a, b, c = st.columns(3)
+    with a:
+        ui.stat_card("Tài sản của bạn", explain.money_short(r["your_value"]), f"{explain.pct(r['your_return'], 1)} so với tiền ròng bỏ vào",
+                     "up" if r["your_return"] >= 0 else "down")
+    with b:
+        ui.stat_card("Nếu bỏ vào VN-Index", explain.money_short(r["index_value"]), f"{explain.pct(r['index_return'], 1)} (chưa trừ phí)",
+                     "up" if r["index_return"] >= 0 else "down")
+    with c:
+        ui.stat_card("Chênh lệch", ("+" if r["diff"] >= 0 else "") + explain.money_short(r["diff"]),
+                     "bạn đang hơn chỉ số" if r["ahead"] else "bạn đang kém chỉ số", "up" if r["ahead"] else "down")
+    st.caption(f"Tính từ {r['first_day']:%d/%m/%Y} đến phiên {r['index_as_of']:%d/%m/%Y}; VN-Index đổi {explain.pct(r['index_change'], 1)} trong thời gian đó. "
+               "Mô phỏng bỏ qua phí và cổ tức của chỉ số, và chỉ phản ánh khoảng thời gian bạn có ghi chép nạp/rút. "
+               "Nếu kém chỉ số kéo dài, mua quỹ chỉ số có thể là lựa chọn đơn giản hơn; đây là thông tin tham khảo, không phải lời khuyên.")
+
+
+def _submit_dividend() -> None:
+    """Chạy khi bấm Ghi cổ tức. Lỗi thì giữ nguyên các ô đã nhập; thành công mới xoá số tiền/ghi chú."""
+    s = st.session_state
+    try:
+        dividends.add(s["dv_day"], s.get("dv_symbol") or "", dividends.CASH if s["dv_kind"] == dividends.LABEL[dividends.CASH] else dividends.BONUS,
+                      float(s.get("dv_amount") or 0), s.get("dv_note", ""), bool(s.get("dv_apply", True)))
+    except ValueError as e:
+        s["dv_error"] = str(e)
+        return
+    s["dv_error"] = None
+    s["dv_flash"] = (f"Đã ghi {s['dv_kind'].lower()} {s['dv_symbol'].upper()}" +
+                     (" và cập nhật Danh mục." if s.get("dv_apply", True) else " (chưa cập nhật Danh mục)."))
+    s["dv_amount"], s["dv_note"] = 0.0, ""
+
+
+def _dividend_section(pf: dict) -> None:
+    """Cổ tức tiền mặt và cổ phiếu thưởng; có thể áp dụng thẳng vào Danh mục (tiền mặt hoặc số cổ phiếu/giá vốn)."""
+    ui.section("Cổ tức", "Cổ tức tiền mặt và cổ phiếu thưởng bạn đã nhận")
+    flash = st.session_state.pop("dv_flash", None)
+    if flash:
+        st.success(flash, icon=":material/check_circle:")
+        st.toast(flash, icon=":material/check_circle:")
+    cost = sum(h["avg_cost"] * h["qty"] for h in pf["holdings"])
+    df = dividends.list_all()
+    sm = dividends.summary(df, cost)
+    if sm["n"]:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            ui.stat_card("Cổ tức tiền mặt đã nhận", explain.money_short(sm["cash_total"]), f"12 tháng gần nhất: {explain.money_short(sm['cash_12m'])}", "up")
+        with c2:
+            ui.stat_card("Tỷ suất cổ tức trên giá vốn", explain.pct(sm["yield_on_cost"], 1, signed=False) if sm["yield_on_cost"] is not None else "Chưa tính được",
+                         "tiền cổ tức 12 tháng ÷ giá vốn danh mục hiện tại")
+        with c3:
+            ui.stat_card("Đã cộng vào tiền mặt Danh mục", explain.money_short(sm["cash_applied"]), "đã nằm trong tổng tài sản và lãi thật")
+        with c4:
+            ui.stat_card("Cổ phiếu thưởng đã nhận", f"{explain.num(sm['bonus_total'])} cp", "")
+    else:
+        ui.callout("Chưa có ghi chép cổ tức. Khi nhận cổ tức tiền mặt hoặc cổ phiếu thưởng, hãy ghi ở đây để lãi thật chính xác hơn.", "info")
+    if st.session_state.get("dv_error"):
+        st.error(st.session_state["dv_error"])
+    st.session_state.setdefault("dv_kind", dividends.LABEL[dividends.CASH])
+    a, b, c = st.columns(3)
+    syms = [h["symbol"] for h in pf["holdings"]]
+    a.date_input("Ngày nhận", value=date.today(), max_value=date.today(), format="DD/MM/YYYY", key="dv_day")
+    b.selectbox("Mã cổ phiếu", syms, key="dv_symbol", accept_new_options=True,
+                help="Chọn trong Danh mục hoặc gõ mã khác (cổ phiếu thưởng chỉ áp dụng được cho mã đang có trong Danh mục).")
+    c.radio("Loại", [dividends.LABEL[dividends.CASH], dividends.LABEL[dividends.BONUS]], key="dv_kind", horizontal=True)
+    is_cash = st.session_state["dv_kind"] == dividends.LABEL[dividends.CASH]
+    d_, e_ = st.columns([1, 2])
+    d_.number_input("Số tiền nhận (đồng)" if is_cash else "Số cổ phiếu thưởng nhận", min_value=0.0, value=0.0,
+                    step=10_000.0 if is_cash else 10.0, format="%.0f", key="dv_amount")
+    d_.caption(f"= {explain.vnd(st.session_state['dv_amount'])}" if is_cash else "")
+    e_.text_input("Ghi chú (không bắt buộc)", key="dv_note", placeholder="Ví dụ: cổ tức đợt 1 năm 2025")
+    st.checkbox("Cập nhật Danh mục luôn" + (" (cộng vào tiền mặt)" if is_cash else " (tăng số lượng, giảm giá vốn bình quân, tổng giá vốn giữ nguyên)"),
+                value=True, key="dv_apply",
+                help="Bỏ chọn nếu bạn đã cập nhật Danh mục (hoặc đã nhập tiền mặt/số lượng đúng) rồi, để tránh cộng hai lần.")
+    st.button(":material/add: Ghi cổ tức", type="primary", key="dv_submit", on_click=_submit_dividend)
+    if len(df):
+        show = df.copy()
+        st.dataframe(pd.DataFrame({"Ngày": show["day"].dt.strftime("%d/%m/%Y"), "Mã": show["symbol"],
+                                   "Loại": show["kind"].map(dividends.LABEL),
+                                   "Số nhận": [explain.vnd(a_) if k == dividends.CASH else f"{explain.num(a_)} cp" for a_, k in zip(show["amount"], show["kind"])],
+                                   "Đã cập nhật Danh mục": show["applied"].map(lambda x: "Có" if x else "Chưa"), "Ghi chú": show["note"]}),
+                     hide_index=True, width="stretch")
+        with st.expander(":material/delete: Xoá một ghi chép cổ tức"):
+            opts = {f"{r.day:%d/%m/%Y} · {r.symbol} · {dividends.LABEL[r.kind]} {explain.num(r.amount)}": int(r.id) for r in show.itertuples()}
+            pick = st.selectbox("Chọn ghi chép cần xoá", list(opts), key="dv_del_pick")
+            st.caption("Xoá ghi chép KHÔNG hoàn lại thay đổi đã áp dụng vào Danh mục (tiền mặt hoặc số cổ phiếu). Nếu cần, hãy sửa ở tab “Nhập tay”.")
+            if st.button("Xoá ghi chép này", key="dv_del"):
+                dividends.delete(opts[pick])
+                st.session_state["dv_flash"] = "Đã xoá ghi chép."
+                st.rerun()
+
+
 def _submit_cashflow() -> None:
     """Chạy khi bấm Ghi giao dịch (trước khi trang vẽ lại). Chỉ xoá ô nhập khi ghi THÀNH CÔNG; lỗi thì giữ nguyên lựa chọn của bạn."""
     s = st.session_state
@@ -198,7 +295,7 @@ def _submit_cashflow() -> None:
     s["cf_amount"], s["cf_note"] = 0.0, ""
 
 
-def _cashflow_section(total: float, cash: float, has_holdings: bool, capital: float) -> None:
+def _cashflow_section(total: float, cash: float, has_holdings: bool, capital: float, div_applied: float = 0.0) -> None:
     """Tiền nạp/rút: tách lãi thật do đầu tư khỏi số tiền bạn bỏ thêm vào."""
     ui.section("Tiền nạp/rút và lãi thật", "Tách phần lãi do đầu tư khỏi phần tiền bạn bỏ thêm vào")
     msg = st.session_state.pop("cf_flash", None)
@@ -232,6 +329,8 @@ def _cashflow_section(total: float, cash: float, has_holdings: bool, capital: fl
         if cash <= 0 and has_holdings:
             ui.callout("Tiền mặt trong Danh mục đang là 0đ. Nếu tài khoản còn tiền mặt, hãy nhập ở tab “Nhập tay” bên dưới, nếu không tổng tài sản bị thiếu "
                        "và lãi thật sẽ bị tính thấp hơn thực tế.", "warn")
+        if div_applied > 0:
+            st.caption(f"Trong lãi thật đã có {explain.vnd(div_applied)} cổ tức tiền mặt bạn đã ghi và cộng vào tiền mặt Danh mục (xem mục Cổ tức bên dưới).")
         st.caption("Lãi thật = tổng tài sản hiện tại trừ đi tiền ròng bạn đã bỏ vào. Đã gồm lãi/lỗ đã chốt, cổ tức, phí và thuế mà giá trên màn hình chưa thể hiện. "
                    "Tỷ suất quy năm cho biết nếu giữ tốc độ này một năm thì được bao nhiêu %, và chỉ hiện khi đã đủ lâu.")
     if st.session_state.get("cf_error"):
@@ -273,10 +372,7 @@ def _journal_sync_button(pf, kp: str) -> None:
 
 def _read_upload(up) -> dict:
     """Trả về {tên trang tính: bảng}. CSV chỉ có một bảng; Excel có thể có nhiều trang tính."""
-    data = io.BytesIO(up.getvalue())  # đọc từ bản sao: không phụ thuộc vị trí con trỏ sau các lần chạy lại
-    if up.name.lower().endswith(".csv"):
-        return {"CSV": pd.read_csv(data, sep=None, engine="python", encoding="utf-8-sig", dtype=str, header=0)}
-    return pd.read_excel(data, sheet_name=None, dtype=str, header=0)  # tất cả trang tính
+    return inbox_mod.read_bytes(up.name, up.getvalue())  # đọc từ bản sao: không phụ thuộc vị trí con trỏ sau các lần chạy lại
 
 
 def _show_rows(rows) -> None:
@@ -333,8 +429,19 @@ def _file_tab(pf) -> None:
                "Cách này không cần khoá hay mật khẩu nào, và file chỉ được xử lý trên máy bạn.")
     sample = "Mã CK,Khối lượng,Giá vốn (đ)\nFPT,100,98500\nHPG,200,24000\n".encode("utf-8-sig")
     st.download_button(":material/download: Tải file mẫu (CSV)", sample, "mau_danh_muc.csv", "text/csv", key="pf_sample")
+    st.caption(f"Muốn không phải tải lên mỗi lần: thả file vào thư mục `{inbox_mod.inbox_dir()}`, app tự đọc (xem Cài đặt, mục “Tự nhập sao kê”).")
     up = st.file_uploader("Chọn file", type=["csv", "xlsx"], key=f"pf_file_{st.session_state.get('pf_up_gen', 0)}")
     if not up:
+        with st.expander(":material/content_paste: Hoặc dán bảng copy từ trang web (không cần tải file)"):
+            st.caption("Mở trang danh mục hoặc lịch sử lệnh trên web công ty chứng khoán, bôi đen cả bảng (gồm dòng tiêu đề), copy rồi dán vào đây.")
+            pasted = st.text_area("Dán bảng", key="pf_paste", height=140, label_visibility="collapsed")
+            if pasted.strip():
+                try:
+                    _render_import(inbox_mod.read_pasted(pasted), pf)
+                except ValueError as e:
+                    ui.callout(str(e), "warn")
+                except Exception as e:  # noqa: BLE001
+                    ui.callout(f"Không đọc được bảng đã dán ({type(e).__name__}).", "bad")
         return
     try:
         sheets = _read_upload(up)
@@ -344,6 +451,11 @@ def _file_tab(pf) -> None:
     except Exception as e:  # noqa: BLE001
         ui.callout(f"Không đọc được file ({type(e).__name__}). Thử xuất lại dạng CSV hoặc .xlsx.", "bad")
         return
+    _render_import(sheets, pf)
+
+
+def _render_import(sheets: dict, pf) -> None:
+    """Từ các bảng đã đọc (tải lên hoặc dán): nhận loại file, cho xem trước và chọn cách lưu."""
     names = list(sheets)
     auto = next((n for n in names if portfolio.parse_file(sheets[n])[0]), None)  # trang tính đầu tiên đọc được
     sheet = names[0]
@@ -444,7 +556,8 @@ def render(ctx) -> None:
     pf = portfolio.load()
     empty = not pf["holdings"] and not pf["cash"]
     if not empty:
-        df, s = portfolio.valuate(pf, _last_price, st.session_state.get("max_alloc", 30) / 100)
+        capital = float(st.session_state.get("capital_m", 0.0)) * 1_000_000
+        df, s = portfolio.valuate(pf, _last_price, st.session_state.get("max_alloc", 30) / 100, capital)
         label = SOURCE_LABEL.get(pf["source"], "không rõ")
         age = (datetime.now() - datetime.fromisoformat(pf["as_of"])).days if pf["as_of"] else None
         st.caption(f"Nguồn: {label} · cập nhật {datetime.fromisoformat(pf['as_of']):%H:%M %d/%m/%Y}" if pf["as_of"] else f"Nguồn: {label}")
@@ -452,16 +565,23 @@ def render(ctx) -> None:
             ui.callout(f"Danh mục được cập nhật lần cuối cách đây {age} ngày. Nếu bạn đã mua hoặc bán thêm, hãy cập nhật lại bên dưới.", "warn")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            ui.stat_card("Tổng tài sản", explain.money_short(s["total"]), explain.vnd(s["total"]))
+            ui.stat_card("Tổng tài sản", explain.money_short(s["base"]), "theo vốn bạn đặt ở Cài đặt" if s["assumed_cash"] > 0 else explain.vnd(s["total"]))
         with c2:
-            ui.stat_card("Cổ phiếu", explain.money_short(s["stock_value"]), f"{s['n']} mã")
+            ui.stat_card("Cổ phiếu", explain.money_short(s["stock_value"]),
+                         f"{s['n']} mã · {explain.pct(s['stock_value'] / s['base'], 0, signed=False)} tổng tài sản" if s["base"] else f"{s['n']} mã")
         with c3:
-            ui.stat_card("Tiền mặt", explain.money_short(s["cash"]),
-                         explain.pct(s["cash"] / s["total"], 0, signed=False) + " tổng tài sản" if s["total"] else "")
+            eff_cash = s["cash"] + s["assumed_cash"]
+            ui.stat_card("Tiền mặt / chưa đầu tư", explain.money_short(eff_cash),
+                         explain.pct(eff_cash / s["base"], 0, signed=False) + " tổng tài sản" if s["base"] else "")
         with c4:
             k = ui.change_kind(s["pnl"])
             ui.stat_card("Lãi/lỗ tạm tính", ("+" if s["pnl"] >= 0 else "-") + explain.money_short(abs(s["pnl"])),
                          (explain.pct(s["pnl_pct"], 1) + " so với giá vốn") if s["pnl_pct"] is not None else "Thiếu giá vốn", k)
+        if s["assumed_cash"] > 0:
+            ui.callout(f"Bạn chỉ đầu tư một phần tổng tài sản: Danh mục ghi {explain.vnd(s['total'])} (cổ phiếu {explain.money_short(s['stock_value'])}, "
+                       f"tiền mặt đã ghi {explain.money_short(s['cash'])}) trong khi vốn bạn đặt là {explain.vnd(s['base'])}. "
+                       f"Các tỷ lệ % (tỷ trọng, tiền mặt, rủi ro) tính trên {explain.money_short(s['base'])}; phần {explain.money_short(s['assumed_cash'])} "
+                       "chưa ghi được coi là tiền chưa đầu tư. Muốn đổi, sửa vốn ở trang Cài đặt.", "info")
         for w in s["warnings"]:
             ui.callout(w, "warn")
 
@@ -491,13 +611,17 @@ def render(ctx) -> None:
                        "“Cắt lỗ (nhật ký)” lấy từ lệnh cùng mã bạn đã ghi; “chưa đặt” nghĩa là mã này chưa có mức cắt lỗ.")
         with right:
             ui.section("Tỷ trọng")
-            _donut(df, s["cash"], s["total"])
+            _donut(df, s["cash"] + s["assumed_cash"], s["base"])
         _risk_section(df, s, pf)
     else:
         ui.callout("Chưa có danh mục. Chọn một cách nhập bên dưới. Nếu bạn dùng TCBS, có thể kết nối chỉ-đọc để lấy tự động.", "info")
 
+    holdings_news.render()
     _cashflow_section(s["total"] if not empty else pf["cash"], pf["cash"], bool(pf["holdings"]),
-                      float(st.session_state.get("capital_m", 10.0)) * 1_000_000)
+                      float(st.session_state.get("capital_m", 10.0)) * 1_000_000,
+                      dividends.summary(dividends.list_all())["cash_applied"])
+    _benchmark_section(s["total"] if not empty else pf["cash"])
+    _dividend_section(pf)
 
     ui.section("Cập nhật danh mục")
     t1, t2, t3, t4 = st.tabs(["Nhập tay", "Nhập từ file", "Từ nhật ký", "Kết nối TCBS (chỉ đọc)"])

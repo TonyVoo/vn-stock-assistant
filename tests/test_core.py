@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -1180,3 +1181,1120 @@ def test_update_button_downloads_reports_progress_and_isolates_failures(tmp_path
     next(b for b in at2.button if "Cập nhật giá" in b.label).click().run()
     text2 = " ".join(m.value for m in at2.markdown)
     assert sorted(p.stem for p in prices.glob("*.csv")) == ["FPT", "VNINDEX"] and "Đã cập nhật 2/3 mã" in text2 and "HPG: lỗi" in text2
+
+
+# ---------- đồng bộ giá giữa các trang ----------
+def _write_price_file(folder, sym, last_close, n=120):
+    idx = pd.bdate_range(end="2026-11-04", periods=n)
+    close = np.full(n, 20_000.0)
+    close[-1] = last_close
+    pd.DataFrame({"date": idx, "open": close, "high": close, "low": close, "close": close, "volume": 2_000_000}).to_csv(folder / f"{sym}.csv", index=False)
+
+
+def test_all_pages_see_new_prices_even_when_files_are_updated_outside_the_app(tmp_path, monkeypatch):
+    """Cập nhật giá bằng lệnh Terminal/tiến trình khác (không qua nút trong app) cũng phải làm MỌI trang đổi theo, không chờ hết hạn bộ nhớ đệm."""
+    import os
+    from src import data as data_mod
+    from views import portfolio_view, shared
+    monkeypatch.setattr(data_mod, "CSV_DIR", tmp_path)
+    for sym in ("AAA", "VNINDEX"):
+        _write_price_file(tmp_path, sym, 20_000.0 if sym == "AAA" else 1_700.0)
+    shared.load.clear() if hasattr(shared.load, "clear") else shared.clear_price_caches()
+    assert shared.load("AAA")[0]["close"].iloc[-1] == 20_000
+    assert shared.load_long("AAA")[0]["close"].iloc[-1] == 20_000
+    assert shared.snapshot(("AAA",))[0][0]["close"] == 20_000
+    assert portfolio_view._last_price("AAA") == 20_000
+    # file giá được ghi đè từ bên ngoài (giá tăng 10%), KHÔNG gọi xoá bộ nhớ đệm
+    _write_price_file(tmp_path, "AAA", 22_000.0)
+    stamp = os.stat(tmp_path / "AAA.csv").st_mtime + 5
+    os.utime(tmp_path / "AAA.csv", (stamp, stamp))
+    assert shared.load("AAA")[0]["close"].iloc[-1] == 22_000                       # Danh mục / Nhật ký
+    assert shared.load_long("AAA")[0]["close"].iloc[-1] == 22_000                  # Tra cứu cổ phiếu / biểu đồ
+    snap = shared.snapshot(("AAA",))[0][0]
+    assert snap["close"] == 22_000 and abs(snap["change"] - 0.10) < 1e-9           # Tổng quan: giá và % thay đổi
+    assert portfolio_view._last_price("AAA") == 22_000
+    # giá trị danh mục đi theo giá: 1.000 cổ phiếu x 22.000
+    pf = {"holdings": [{"symbol": "AAA", "qty": 1000, "avg_cost": 20_000.0, "market_value": None}], "cash": 0.0}
+    df, s = portfolio.valuate(pf, portfolio_view._last_price)
+    assert s["stock_value"] == 22_000_000 and s["pnl"] == 2_000_000
+
+
+# ---------- phân tích Nhật ký (thẻ lỗi, thời gian giữ) ----------
+import sqlite3  # noqa: E402
+
+from src import journal_stats  # noqa: E402
+
+
+def _stats_journal(db):
+    def trade(sym_days, gross_pct, stop=95_000, tags="", reason="lý do", opened_day="2026-01-01"):
+        days = sym_days
+        o = pd.Timestamp(opened_day)
+        t = journal.add_trade("FPT", 100, 100_000, stop, None, reason, o.date().isoformat(), db)
+        journal.close_trade(t, 100_000 * (1 + gross_pct), (o + pd.Timedelta(days=days)).date().isoformat(), "", db)
+        if tags:
+            journal.update_trade(t, db, tags=tags)
+        return t
+    for d, g in ((20, .10), (10, .08), (40, .05), (15, -.04)):                       # nhóm bình thường: 3 thắng, 1 thua
+        trade(d, g)
+    for d, g in ((5, -.08), (3, -.06), (2, .02), (6, -.10)):                         # mua đuổi giá: 1 thắng, 3 thua
+        trade(d, g, tags="Mua đuổi giá (FOMO)")
+    for d, g in ((60, -.12), (45, -.09), (10, .03)):                                 # không cắt lỗ + chưa ghi lý do: 1 thắng, 2 thua
+        trade(d, g, stop=0, reason=journal.PLACEHOLDER_REASON + " giao dịch (chưa ghi lý do mua)")
+
+
+def test_journal_stats_numbers_by_hand(tmp_path):
+    from src.risk import FEE_RATE, SELL_TAX
+    db = tmp_path / "j.db"
+    _stats_journal(db)
+    # lệnh chưa rõ ngày mua: vẫn tính thắng/thua nhưng KHÔNG đưa vào thống kê thời gian giữ
+    u = journal.add_trade("HPG", 100, 20_000, 19_000, None, "x", "Không rõ", db)
+    journal.close_trade(u, 22_000, "2026-03-01", "", db)
+    d = journal_stats.enrich(journal.list_trades(db))
+    assert len(d) == 12 and d["days"].isna().sum() == 1
+    s = journal_stats.summary(d)
+    assert s["n"] == 12 and abs(s["win_rate"] - 6 / 12) < 1e-12 and not s["reliable"]
+    # tỷ suất sau phí/thuế đúng công thức
+    exp = (110_000 * (1 - FEE_RATE - SELL_TAX) - 100_000 * (1 + FEE_RATE)) / 100_000
+    assert abs(d[d["ret"] > 0.08].iloc[0]["ret"] - exp) < 1e-9
+    tags = journal_stats.by_tag(d).set_index("tag")
+    assert not any(str(x).lower() in ("nan", "none", "") for x in tags.index)                  # lệnh chưa gắn thẻ không được thành thẻ “nan”
+    assert journal.split_tags(float("nan")) == [] and journal.split_tags(None) == [] and journal.split_tags("a|b") == ["a", "b"]
+    fomo = tags.loc["Mua đuổi giá (FOMO)"]
+    assert fomo["n"] == 4 and fomo["win_rate"] == 0.25 and fomo["small"] is np.True_ or fomo["small"] is True
+    assert tags.loc[journal_stats.TAG_NO_STOP, "n"] == 3 and abs(tags.loc[journal_stats.TAG_NO_STOP, "win_rate"] - 1 / 3) < 1e-12   # tự nhận từ stop = 0
+    assert tags.loc[journal_stats.TAG_NO_REASON, "n"] == 3                                                                       # tự nhận từ lý do mặc định
+    hold = journal_stats.by_holding(d).set_index("bucket")
+    assert (hold.loc["Tối đa 7 ngày", "n"], hold.loc["8 đến 30 ngày", "n"], hold.loc["31 đến 90 ngày", "n"]) == (4, 4, 3)       # 11 lệnh có ngày
+    st = journal_stats.by_stop(d).set_index("group")
+    assert st.loc["Có đặt cắt lỗ", "n"] == 9 and st.loc["Chưa đặt cắt lỗ", "n"] == 3
+    # nhận xét: mua đuổi giá kém hơn phần còn lại; có cảnh báo mẫu nhỏ; không bịa nhận xét “giữ lỗ lâu” khi số liệu không đủ lệch
+    text = " ".join(journal_stats.insights(d))
+    assert "Mua đuổi giá (FOMO)" in text and "kém hơn" in text and "Mới có 12 lệnh" in text and "giữ lệnh lỗ lâu hơn" not in text
+
+
+def test_journal_stats_stay_silent_with_too_little_data(tmp_path):
+    db = tmp_path / "j.db"
+    for g in (.05, -.03):
+        t = journal.add_trade("FPT", 100, 100_000, 95_000, None, "x", "2026-01-01", db)
+        journal.close_trade(t, 100_000 * (1 + g), "2026-01-10", "", db)
+    d = journal_stats.enrich(journal.list_trades(db))
+    ins = journal_stats.insights(d)
+    assert len(ins) == 1 and "Mới có 2 lệnh" in ins[0]                                    # không rút kết luận từ 2 lệnh
+    assert journal_stats.enrich(pd.DataFrame()).empty and journal_stats.insights(journal_stats.enrich(None)) == []
+
+
+def test_tags_roundtrip_normalisation_and_safe_migration_of_old_database(tmp_path):
+    # cơ sở dữ liệu CŨ (chưa có cột tags) vẫn mở được, giữ nguyên dữ liệu, tự thêm cột
+    old = tmp_path / "old.db"
+    c = sqlite3.connect(old)
+    c.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY AUTOINCREMENT, opened TEXT NOT NULL, symbol TEXT NOT NULL, qty INTEGER NOT NULL, "
+              "entry REAL NOT NULL, stop REAL NOT NULL, target REAL, reason TEXT, closed TEXT, exit_price REAL, note TEXT)")
+    c.execute("INSERT INTO trades(opened,symbol,qty,entry,stop,reason) VALUES ('2026-01-01','ACB',400,22732,0,'lệnh cũ')")
+    c.commit(); c.close()
+    df = journal.list_trades(old)
+    assert len(df) == 1 and df.iloc[0]["symbol"] == "ACB" and df.iloc[0]["reason"] == "lệnh cũ" and "tags" in df.columns
+    tid = int(df.iloc[0]["id"])
+    journal.update_trade(tid, old, tags=["Mua vì tin đồn", "mua vì tin đồn", " ", "Đúng kế hoạch|x", "A" * 80])
+    got = journal.split_tags(journal.get_trade(tid, old)["tags"])
+    assert got == ["Mua vì tin đồn", "Đúng kế hoạch x", "A" * 40]                           # bỏ trùng (không phân biệt hoa thường), bỏ trống, cắt độ dài, bỏ ký tự phân cách
+    journal.update_trade(tid, old, stop=20_000)                                              # sửa trường khác không làm mất thẻ
+    assert journal.split_tags(journal.get_trade(tid, old)["tags"]) == got
+    with pytest.raises(ValueError):
+        journal.update_trade(tid, old, tags=[f"t{i}" for i in range(9)])
+    assert journal.get_trade(tid, old)["stop"] == 20_000 and journal.split_tags(journal.get_trade(tid, old)["tags"]) == got   # lỗi: không đổi gì
+
+
+def test_journal_page_tags_are_saved_and_analysis_section_appears(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    db = tmp_path / "j.db"
+    monkeypatch.setenv("TEST_JOURNAL", str(db))
+    o = journal.add_trade("FPT", 100, 100_000, 0, None, "", "Không rõ", db)
+    c = journal.add_trade("HPG", 200, 25_000, 23_000, None, "bán thử", "2026-02-01", db)
+    journal.close_trade(c, 22_000, "2026-03-01", "", db)
+    script = str(Path(__file__).resolve().parent / "ui_journal_edit_app.py")
+    at = AppTest.from_file(script, default_timeout=60).run()
+    assert not at.exception
+    text = " ".join(m.value for m in at.markdown)
+    assert "Phân tích nhật ký" in text and "Lệnh đã bán" in text and "Mới có 1 lệnh" in text                 # có phân tích, kèm cảnh báo mẫu nhỏ
+    at.multiselect(key=f"jq_tags_{o}").select("Mua đuổi giá (FOMO)").select("Mua vì tin đồn")
+    at.text_area(key=f"jq_reason_{o}").set_value("thấy mọi người nói tăng")
+    next(b for b in at.button if b.label == "Lưu").click().run()
+    assert not at.exception and not at.error
+    assert journal.split_tags(journal.get_trade(o, db)["tags"]) == ["Mua đuổi giá (FOMO)", "Mua vì tin đồn"]
+    # thẻ đã lưu hiện lại khi mở lại trang, và sửa nhanh không làm mất chúng
+    at2 = AppTest.from_file(script, default_timeout=60).run()
+    assert at2.multiselect(key=f"jq_tags_{o}").value == ["Mua đuổi giá (FOMO)", "Mua vì tin đồn"]
+
+
+# ---------- cổ tức ----------
+from src import dividends  # noqa: E402
+
+
+def _div_env(tmp_path):
+    pf = tmp_path / "pf.json"
+    portfolio.save({"holdings": [{"symbol": "FPT", "qty": 1000, "avg_cost": 20_000.0, "market_value": 25_000_000},
+                                 {"symbol": "HPG", "qty": 500, "avg_cost": 24_000.0}], "cash": 1_000_000.0}, "import", pf)
+    return tmp_path / "d.db", pf
+
+
+def test_cash_dividend_applies_to_portfolio_cash_and_true_profit(tmp_path):
+    db, pf = _div_env(tmp_path)
+    today = date.today()
+    dividends.add(today, "fpt", dividends.CASH, 500_000, "cổ tức 2025", True, db, pf)
+    p = portfolio.load(pf)
+    assert p["cash"] == 1_500_000 and [h["qty"] for h in p["holdings"]] == [1000, 500]     # chỉ tiền mặt đổi
+    row = dividends.list_all(db).iloc[0]
+    assert row["symbol"] == "FPT" and row["applied"] == 1 and row["amount"] == 500_000
+    # không áp dụng: chỉ ghi chép, Danh mục giữ nguyên
+    dividends.add(today, "HPG", dividends.CASH, 200_000, "", False, db, pf)
+    assert portfolio.load(pf)["cash"] == 1_500_000
+
+
+def test_bonus_shares_keep_total_cost_and_failures_write_nothing(tmp_path):
+    db, pf = _div_env(tmp_path)
+    today = date.today()
+    dividends.add(today, "FPT", dividends.BONUS, 100, "thưởng 10%", True, db, pf)
+    h = {x["symbol"]: x for x in portfolio.load(pf)["holdings"]}
+    assert h["FPT"]["qty"] == 1100 and abs(h["FPT"]["avg_cost"] * 1100 - 20_000_000) < 1e-6     # tổng giá vốn không đổi
+    assert abs(h["FPT"]["avg_cost"] - 20_000_000 / 1100) < 1e-9 and h["FPT"]["market_value"] is None
+    assert h["HPG"]["qty"] == 500                                                                  # mã khác không bị động tới
+    # áp dụng thất bại (mã không có trong Danh mục): không ghi gì cả, ở cả hai nơi
+    before_pf, before_n = portfolio.load(pf), len(dividends.list_all(db))
+    with pytest.raises(ValueError, match="chưa có"):
+        dividends.add(today, "VNM", dividends.BONUS, 50, "", True, db, pf)
+    assert portfolio.load(pf) == before_pf and len(dividends.list_all(db)) == before_n
+    # nhập sai
+    for bad in (dict(day=today + timedelta(days=1), amount=100), dict(day=today, amount=0), dict(day=today, amount=-5),
+                dict(day=today, amount=float("nan")), dict(day=today, amount=10.5, kind=dividends.BONUS),
+                dict(day=today, amount=100, symbol="<x>"), dict(day=today, amount=100, kind="khac")):
+        args = dict(day=today, symbol="FPT", kind=dividends.CASH, amount=100) | bad
+        with pytest.raises(ValueError):
+            dividends.add(args["day"], args["symbol"], args["kind"], args["amount"], "", False, db, pf)
+    assert len(dividends.list_all(db)) == before_n
+
+
+def test_dividend_summary_numbers_and_delete_does_not_revert_portfolio(tmp_path):
+    db, pf = _div_env(tmp_path)
+    today = date.today()
+    dividends.add(today - timedelta(days=30), "FPT", dividends.CASH, 400_000, "", True, db, pf)
+    dividends.add(today - timedelta(days=200), "HPG", dividends.CASH, 100_000, "", False, db, pf)
+    dividends.add(today - timedelta(days=400), "FPT", dividends.CASH, 300_000, "", False, db, pf)            # quá 12 tháng
+    dividends.add(today - timedelta(days=20), "FPT", dividends.BONUS, 100, "", False, db, pf)
+    s = dividends.summary(dividends.list_all(db), holdings_cost=20_000_000 + 12_000_000, today=today)
+    assert s["n"] == 4 and s["cash_total"] == 800_000 and s["cash_12m"] == 500_000 and s["cash_applied"] == 400_000
+    assert abs(s["yield_on_cost"] - 500_000 / 32_000_000) < 1e-12 and s["bonus_total"] == 100
+    by = s["by_symbol"].set_index("symbol")
+    assert by.loc["FPT", "cash"] == 700_000 and by.loc["FPT", "shares"] == 100 and by.loc["HPG", "cash"] == 100_000
+    cash_after = portfolio.load(pf)["cash"]
+    dividends.delete(int(dividends.list_all(db).iloc[0]["id"]), db)
+    assert portfolio.load(pf)["cash"] == cash_after and len(dividends.list_all(db)) == 3                      # xoá ghi chép không hoàn lại Danh mục
+    assert dividends.summary(pd.DataFrame())["n"] == 0
+
+
+def test_dividend_ui_records_applies_and_keeps_input_on_error(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    from src import dividends as dv
+    monkeypatch.setenv("TEST_DIV", str(tmp_path / "d.db"))
+    monkeypatch.setenv("TEST_PF", str(tmp_path / "pf.json"))
+    portfolio.save({"holdings": [{"symbol": "FPT", "qty": 100, "avg_cost": 100_000.0}], "cash": 1_000_000.0}, "manual", tmp_path / "pf.json")
+    script = str(Path(__file__).resolve().parent / "ui_dividend_app.py")
+    at = AppTest.from_file(script, default_timeout=30).run()
+    assert not at.exception
+    at.number_input(key="dv_amount").set_value(0.0)
+    next(b for b in at.button if "Ghi cổ tức" in b.label).click().run()
+    assert any("lớn hơn 0" in e.value for e in at.error) and len(dv.list_all(tmp_path / "d.db")) == 0
+    at.text_input(key="dv_note").set_value("đợt 1")
+    at.number_input(key="dv_amount").set_value(500_000.0)
+    next(b for b in at.button if "Ghi cổ tức" in b.label).click().run()
+    assert not at.exception
+    assert len(dv.list_all(tmp_path / "d.db")) == 1
+    assert portfolio.load(tmp_path / "pf.json")["cash"] == 1_500_000.0            # đã cộng vào tiền mặt Danh mục
+    assert at.number_input(key="dv_amount").value == 0 and at.text_input(key="dv_note").value == ""
+    assert any("Đã ghi" in s.value for s in at.success)
+
+
+# ---------- mua dần (DCA) ----------
+def test_dca_split_lots_fees_and_carry():
+    from src import dca
+    r = dca.plan(5_000_000, 4, {"AAA": 20_000.0, "BBB": 50_000.0}, mode=dca.SPLIT)
+    s = r["schedule"]
+    assert (s["qty"] % 100 == 0).all()
+    # 2,5 triệu/mã/tháng: AAA 20.000 -> 1 lô = 2.003.000 -> 100 cp mỗi tháng (dư dồn lại); BBB 1 lô = 5.007.500 -> tháng 2 mới có 5.000.000 (chưa đủ), tháng 3 mới mua được
+    a = s[s["symbol"] == "AAA"].reset_index(drop=True)
+    b = s[s["symbol"] == "BBB"].reset_index(drop=True)
+    assert list(a["qty"]) == [100, 100, 100, 100] and list(b["qty"]) == [0, 0, 100, 0]
+    assert abs(r["invested"] + r["leftover"] - r["total_budget"]) < 1e-6          # tiền vào = đã mua + còn dư, không mất đồng nào
+    assert r["by_symbol"].set_index("symbol").loc["AAA", "avg_cost"] == 20_000 * 1.0015
+
+
+def test_dca_rotate_unaffordable_note_and_validation():
+    from src import dca
+    r = dca.plan(1_000_000, 6, {"AAA": 20_000.0, "BBB": 400_000.0}, mode=dca.ROTATE)
+    assert r["by_symbol"].set_index("symbol")["qty"].get("BBB", 0) == 0 and any("BBB" in n for n in r["notes"])
+    assert abs(r["invested"] + r["leftover"] - r["total_budget"]) < 1e-6
+    for bad in (dict(budget=0, months=3), dict(budget=1e6, months=0), dict(budget=1e6, months=999), dict(budget=float("nan"), months=3)):
+        with pytest.raises(ValueError):
+            dca.plan(bad["budget"], bad["months"], {"AAA": 20_000.0})
+    with pytest.raises(ValueError):
+        dca.plan(1e6, 3, {"AAA": 0.0})
+
+
+def test_dca_page_renders_without_error(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    monkeypatch.setenv("TEST_PF", str(tmp_path / "pf.json"))
+    at = AppTest.from_file(str(Path(__file__).resolve().parent / "ui_dca_app.py"), default_timeout=30).run()
+    assert not at.exception
+    at.number_input(key="dca_months").set_value(6)
+    at.run()
+    assert not at.exception
+
+
+# ---------- báo cáo tháng ----------
+def test_monthly_report_collects_only_that_month_and_exports(tmp_path):
+    import io
+    from src import report, dividends as dv
+    from openpyxl import load_workbook
+    jdb, cdb, ddb, pfp = tmp_path / "j.db", tmp_path / "c.db", tmp_path / "d.db", tmp_path / "pf.json"
+    a = journal.add_trade("FPT", 100, 100_000, 95_000, None, "t10", "2026-10-02", jdb)
+    journal.close_trade(a, 110_000, "2026-10-20", "", jdb)                      # đã bán tháng 10
+    b = journal.add_trade("VNM", 100, 60_000, 57_000, None, "t09", "2026-09-02", jdb)
+    journal.close_trade(b, 55_000, "2026-09-25", "", jdb)                       # đã bán tháng 9 (không vào báo cáo tháng 10)
+    cashflow.add("2026-10-03", 5_000_000, "nạp", cdb)
+    portfolio.save({"holdings": [{"symbol": "FPT", "qty": 100, "avg_cost": 100_000.0}], "cash": 1_000_000.0}, "manual", pfp)
+    dv.add("2026-10-15", "FPT", dv.CASH, 200_000, "", False, ddb, pfp)
+    dv.add("2026-09-15", "FPT", dv.CASH, 999_000, "", False, ddb, pfp)
+    d = report.collect(2026, 10, lambda s: 120_000.0, jdb, cdb, ddb, pfp)
+    assert list(d["closed"]["symbol"]) == ["FPT"] and abs(d["realized"] - d["closed"]["pnl"].iloc[0]) < 1e-6
+    assert d["div_cash"] == 200_000 and len(d["flows"]) == 1
+    xl = load_workbook(io.BytesIO(report.to_excel(d)))
+    assert "Tổng quan" in xl.sheetnames and "Lệnh đã bán trong tháng" in xl.sheetnames
+    with pytest.raises(ValueError):
+        report.collect(2026, 13, lambda s: 1.0, jdb, cdb, ddb, pfp)
+    if report.pdf_available():
+        pdf = report.to_pdf(d)
+        assert pdf[:4] == b"%PDF" and len(pdf) > 2000
+
+
+def test_auto_refresh_hours_settings_and_throttle(monkeypatch, tmp_path):
+    import datetime as dt
+    from views import data_update as du
+    from src import settings
+    tz = explain.VN_TZ
+    assert du.in_trading_hours(dt.datetime(2026, 11, 5, 10, 0, tzinfo=tz))            # thứ Năm 10:00
+    assert not du.in_trading_hours(dt.datetime(2026, 11, 5, 15, 30, tzinfo=tz))       # sau giờ đóng cửa
+    assert not du.in_trading_hours(dt.datetime(2026, 11, 7, 10, 0, tzinfo=tz))        # thứ Bảy
+    assert settings.clean({})["auto_price"] is True and settings.clean({"auto_price": False})["auto_price"] is False
+    assert settings.clean({"auto_price": "x"})["auto_price"] is True                  # giá trị hỏng -> mặc định
+    p = tmp_path / "s.json"
+    assert settings.load(settings.save({"capital_m": 10, "auto_price": False}, p) and p)["auto_price"] is False
+
+
+# ---------- sao lưu / cảnh báo / so sánh VN-Index ----------
+def _backup_paths(d):
+    return {"journal.db": d / "journal.db", "cashflows.db": d / "cashflows.db", "dividends.db": d / "dividends.db",
+            "paper.db": d / "paper.db", "portfolio.json": d / "portfolio.json", "settings.json": d / "settings.json"}
+
+
+def test_backup_roundtrip_and_restore_makes_safety_copy(tmp_path):
+    import zipfile
+    from src import backup
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    paths = _backup_paths(data_dir)
+    journal.add_trade("FPT", 100, 100_000, 95_000, None, "gốc", "2026-01-05", paths["journal.db"])
+    portfolio.save({"holdings": [], "cash": 5.0}, "manual", paths["portfolio.json"])
+    blob = backup.create(paths)
+    assert "journal.db" in backup.inspect(blob)["files"]
+    journal.add_trade("VNM", 100, 60_000, 57_000, None, "thêm sau", "2026-02-05", paths["journal.db"])   # thay đổi sau khi sao lưu
+    res = backup.restore(blob, paths, tmp_path / "bk")
+    assert len(journal.list_trades(paths["journal.db"])) == 1                                              # đã quay về trạng thái lúc sao lưu
+    assert res["safety_copy"].exists()                                                                     # bản an toàn của dữ liệu trước khi khôi phục
+    with zipfile.ZipFile(res["safety_copy"]) as z:
+        assert "journal.db" in z.namelist()
+
+
+def test_backup_rejects_bad_and_malicious_archives(tmp_path):
+    import io, zipfile
+    from src import backup
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    paths = _backup_paths(data_dir)
+    journal.add_trade("FPT", 100, 100_000, 95_000, None, "gốc", "2026-01-05", paths["journal.db"])
+    for bad in (b"not a zip", ):
+        with pytest.raises(ValueError):
+            backup.restore(bad, paths, tmp_path / "bk")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("../evil.txt", "x")                       # tên lạ bị bỏ qua, không bao giờ ghi ra ngoài
+        z.writestr("journal.db", b"this is not sqlite")      # CSDL giả bị từ chối
+    with pytest.raises(ValueError):
+        backup.restore(buf.getvalue(), paths, tmp_path / "bk")
+    assert not (tmp_path / "evil.txt").exists() and len(journal.list_trades(paths["journal.db"])) == 1   # dữ liệu cũ còn nguyên
+
+
+def test_alerts_stop_target_and_ignore_unset_stop():
+    from src import alerts
+    t = pd.DataFrame([
+        {"id": 1, "symbol": "AAA", "stop": 95.0, "target": 120.0},
+        {"id": 2, "symbol": "BBB", "stop": 95.0, "target": 120.0},
+        {"id": 3, "symbol": "CCC", "stop": 95.0, "target": 100.0},
+        {"id": 4, "symbol": "DDD", "stop": 0.0, "target": None},
+        {"id": 5, "symbol": "EEE", "stop": 95.0, "target": 120.0}])
+    px = {"AAA": 94.0, "BBB": 97.0, "CCC": 101.0, "DDD": 1.0, "EEE": 105.0}
+    got = {a["symbol"]: a["kind"] for a in alerts.check(t, px.get)}
+    assert got == {"AAA": "hit_stop", "BBB": "near_stop", "CCC": "hit_target"}      # DDD chưa đặt cắt lỗ, EEE ở giữa: không cảnh báo
+    assert alerts.check(t, lambda s: None) == [] and alerts.check(None, px.get) == []
+    assert alerts.check(t, px.get)[0]["symbol"] == "AAA"                              # cắt lỗ xếp trên cùng
+
+
+def test_benchmark_matches_hand_calc_and_handles_gaps():
+    from src import benchmark
+    idx = pd.DataFrame({"date": pd.date_range("2026-01-01", periods=10, freq="D"), "close": [100.0] * 5 + [110.0] * 5})
+    flows = pd.DataFrame({"day": pd.to_datetime(["2026-01-02", "2026-01-07"]), "amount": [1000.0, 1100.0]})
+    r = benchmark.compare(flows, 2300.0, idx)
+    # 1000/100 = 10 đơn vị; 1100/110 = 10 đơn vị; cuối kỳ 20 * 110 = 2200
+    assert r["ok"] and abs(r["index_value"] - 2200) < 1e-6 and r["ahead"] and abs(r["diff"] - 100) < 1e-6
+    assert abs(r["index_return"] - (2200 / 2100 - 1)) < 1e-9
+    early = pd.DataFrame({"day": pd.to_datetime(["2025-12-01"]), "amount": [1000.0]})
+    assert not benchmark.compare(early, 1.0, idx)["ok"] and not benchmark.compare(flows.iloc[0:0], 1.0, idx)["ok"]
+
+
+# ---------- tin tức theo mã đang giữ ----------
+def test_match_symbol_is_exact_and_deduped():
+    from src import news
+    items = [{"title": "FPT báo lãi quý 3", "summary": "", "link": "a", "source": "X"},
+             {"title": "Giá FPTS tăng", "summary": "", "link": "b", "source": "X"},          # FPTS không phải FPT
+             {"title": "fpt viết thường", "summary": "", "link": "c", "source": "X"},       # viết thường không tính
+             {"title": "Tin khác", "summary": "Cổ phiếu FPT được khuyến nghị", "link": "d", "source": "X"},
+             {"title": "FPT báo lãi quý 3", "summary": "", "link": "a", "source": "Y"}]     # trùng liên kết
+    got = news.match_symbol(items, "FPT")
+    assert [g["link"] for g in got] == ["a", "d"]
+    assert news.match_symbol(items, "FPT", limit=1) == got[:1] and news.match_symbol([], "FPT") == []
+
+
+def test_ai_news_summary_is_validated_and_never_leaks_portfolio(monkeypatch):
+    from src import llm
+    by = {"FPT": [{"source": "A", "title": "t0", "summary": "", "link": "l0"}, {"source": "B", "title": "t1", "summary": "", "link": "l1"}],
+          "VNM": []}
+    raw = {"FPT": {"tom_tat": "ok", "tac_dong": "rất tốt", "tin_chinh": [1, 7, -1, True, "0"]},   # tác động lạ, chỉ số sai
+           "HAG": {"tom_tat": "mã không hỏi", "tac_dong": "tich_cuc", "tin_chinh": [0]}}           # mã không được hỏi
+    c = llm.clean_symbol_news(raw, by)
+    assert list(c) == ["FPT"] and c["FPT"]["tac_dong"] == "khong_ro" and c["FPT"]["tin_chinh"] == [1]
+    seen = {}
+    monkeypatch.setattr(llm, "_ask", lambda prompt, n, mock=None: seen.setdefault("p", prompt) and {"FPT": {"tom_tat": "x", "tac_dong": "tich_cuc", "tin_chinh": [0]}})
+    out = llm.summarize_holdings_news(by)
+    assert out["FPT"]["tac_dong"] == "tich_cuc"
+    assert '"FPT"' in seen["p"] and '"VNM"' not in seen["p"]                                       # mã không có tin không bị gửi đi
+    assert llm.summarize_holdings_news({"VNM": []}) == {}                                          # không có tin thì không gọi AI
+
+
+# ---------- đèn giao thông, việc hôm nay, từ điển ----------
+def test_precheck_levels_and_reasons():
+    from src import precheck as pc
+    # lệnh an toàn: tài sản 100 triệu, mua 100 cp giá 25.000, cắt lỗ 23.500, mục tiêu 29.000
+    g = pc.check(25_000, 23_500, 29_000, 100, 100e6, 50e6, 0, 0.02, 0.30, 50e9)
+    assert g["level"] == pc.OK and all(i["level"] == pc.OK for i in g["items"])
+    # dồn quá nhiều vào một mã -> đỏ
+    r = pc.check(25_000, 23_500, 29_000, 1000, 40e6, 40e6, 0, 0.05, 0.30, 50e9)
+    assert r["level"] == pc.BAD and any(i["label"] == "Dồn vào một mã" and i["level"] == pc.BAD for i in r["items"])
+    # không đủ tiền mặt -> đỏ; còn ít tiền mặt -> vàng
+    assert any(i["label"] == "Tiền mặt" and i["level"] == pc.BAD for i in pc.check(25_000, 23_500, 29_000, 100, 100e6, 1e6, 0, 0.02, 0.30, 50e9)["items"])
+    y = pc.check(25_000, 23_500, 29_000, 100, 100e6, 5e6, 0, 0.02, 0.30, 50e9)
+    assert any(i["label"] == "Tiền mặt dự phòng" and i["level"] == pc.WARN for i in y["items"])
+    # cắt lỗ chưa đặt, lãi < lỗ, thanh khoản rất thấp
+    assert pc.check(25_000, 0, 29_000, 100, 100e6, 50e6)["level"] == pc.BAD
+    assert any(i["label"] == "Lãi so với lỗ" and i["level"] == pc.BAD for i in pc.check(25_000, 23_500, 25_500, 100, 100e6, 50e6)["items"])
+    assert any(i["label"] == "Dễ bán" and i["level"] == pc.BAD for i in pc.check(25_000, 23_500, 29_000, 100, 100e6, 50e6, avg_value=5e8)["items"])
+    # không có Danh mục (cash=None) thì không báo tiền mặt; đầu vào sai -> đỏ, không lỗi
+    assert not any("Tiền mặt" in i["label"] for i in pc.check(25_000, 23_500, 29_000, 100, 100e6, None)["items"])
+    assert pc.check(0, 0, None, 0, 0, None)["level"] == pc.BAD
+
+
+def test_todo_priority_limit_and_empty():
+    from datetime import date
+    from src import todo
+    today = date(2026, 11, 5)
+    trades = pd.DataFrame([{"symbol": "FPT", "stop": 0.0, "reason": "Nhập từ sao kê"}, {"symbol": "VNM", "stop": 90.0, "reason": "tốt"}])
+    al = [{"id": 1, "symbol": "HPG", "kind": "hit_stop", "message": "HPG chạm cắt lỗ"}]
+    items = todo.build(al, trades, date(2026, 10, 20), today, {"total": 100.0, "cash": 1.0}, {"FPT": 0.6}, 0.30, True, False)
+    assert len(items) == todo.MAX_ITEMS and items[0]["level"] == "bad" and "HPG" in items[0]["title"]     # khẩn nhất lên đầu, tối đa 3 việc
+    assert "FPT" in items[1]["title"]                                                                      # chưa có cắt lỗ xếp trên các việc nhẹ
+    calm = todo.build([], pd.DataFrame([{"symbol": "VNM", "stop": 90.0, "reason": "tốt"}]), today, today, {"total": 100.0, "cash": 50.0}, {"VNM": 0.2}, 0.30, True, True)
+    assert calm == []                                                                                      # không có việc thì danh sách rỗng
+    assert todo.build([], None, None, today, None, None, 0.3, False, False) == []
+
+
+def test_glossary_examples_use_user_numbers_and_never_crash():
+    from src import glossary
+    p = {"capital": 20_000_000, "entry": 30_000, "stop": 27_000, "risk_pct": 2.0, "max_alloc": 30, "target": 36_000}
+    short, ex = glossary.explain("Cắt lỗ", p)
+    assert "30.000đ" in ex and "27.000đ" in ex and "10%" in ex
+    assert "400.000đ" in glossary.explain("Mức chấp nhận mất", p)[1]
+    for term in glossary.TERMS:
+        s, e = glossary.explain(term, {})                    # thiếu dữ liệu vẫn dùng được số mặc định
+        assert s and isinstance(e, str)
+
+
+def test_calc_page_shows_traffic_light(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    monkeypatch.setenv("TEST_PF", str(tmp_path / "pf.json"))
+    portfolio.save({"holdings": [], "cash": 500_000.0}, "manual", tmp_path / "pf.json")      # tiền mặt ít hơn số cần mua
+    at = AppTest.from_file(str(Path(__file__).resolve().parent / "ui_calc_app.py"), default_timeout=30).run()
+    assert not at.exception
+    text = " ".join(m.value for m in at.markdown)
+    assert "Kiểm tra trước khi mua" in text and "Đèn đỏ" in text and "tiền mặt trong Danh mục chỉ có 500.000đ" in text
+
+
+# ---------- bộ lọc cổ phiếu ----------
+def test_screener_metrics_and_filters():
+    from src import screener
+    n = 260
+    up = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=n), "close": np.linspace(50_000, 100_000, n), "volume": [1_000_000] * n})
+    dn = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=n), "close": np.linspace(100_000, 50_000, n), "volume": [10_000] * n})
+    short = up.head(30)
+    mu, md = screener.metrics("UP", up), screener.metrics("DN", dn)
+    assert screener.metrics("SHORT", short) is None                                          # dưới 60 phiên: không đoán
+    assert mu["above50"] and mu["above200"] and not md["above50"] and mu["ret60"] > 0 > md["ret60"]
+    assert abs(mu["avg_value"] - 1_000_000 * up["close"].tail(20).mean()) < 1
+    m = pd.DataFrame([mu, md])
+    assert list(screener.screen(m)["symbol"]) == ["UP", "DN"]                                # không đặt tiêu chí: giữ hết, xếp theo thanh khoản
+    assert list(screener.screen(m, min_value=1e9)["symbol"]) == ["UP"]                       # DN chỉ giao dịch ~0,5 tỷ
+    assert list(screener.screen(m, trend=screener.TREND_BOTH)["symbol"]) == ["UP"]
+    assert list(screener.screen(m, max_from_high=0.1)["symbol"]) == ["UP"]                   # DN cách đỉnh 1 năm ~50%
+    assert screener.screen(m, min_value=1e15).empty and screener.screen(pd.DataFrame()).empty
+
+
+# ---------- mã PIN, chế độ đơn giản ----------
+def test_pin_guard_locks_after_failures_and_blocks_during_lock(monkeypatch):
+    from src import access
+    now = [1000.0]
+    g = access.Guard("1234", max_fail=3, lock_s=60, clock=lambda: now[0])
+    assert not g.check("0000") and not g.check("1111") and g.remaining_lock() == 0
+    assert not g.check("2222") and g.remaining_lock() == 60                       # lần sai thứ 3: khoá
+    assert not g.check("1234")                                                    # đang khoá: nhập đúng cũng bị từ chối
+    now[0] += 61
+    assert g.check("1234") and g.fails == 0                                       # hết khoá: nhập đúng vào được
+    monkeypatch.delenv("APP_PIN", raising=False)
+    assert access.guard() is None                                                 # không đặt PIN thì không hỏi
+    monkeypatch.setenv("APP_PIN", " 4321 ")
+    assert access.guard().pin == "4321"
+
+
+def test_simple_mode_setting_roundtrip(tmp_path):
+    assert settings_mod.clean({})["simple_mode"] is False
+    assert settings_mod.clean({"simple_mode": True})["simple_mode"] is True
+    assert settings_mod.clean({"simple_mode": "yes"})["simple_mode"] is False
+    p = tmp_path / "s.json"
+    assert settings_mod.save({"simple_mode": True, "auto_price": False}, p)["simple_mode"] is True
+    assert settings_mod.load(p)["auto_price"] is False
+
+
+def test_auto_refresh_runs_in_background_thread_and_does_not_block(monkeypatch):
+    import time as _t
+    from views import data_update as du
+    gate = {"go": False}
+
+    def slow_update(symbols, **kw):
+        while not gate["go"]:
+            _t.sleep(0.01)
+        return [{"symbol": s, "status": "ok", "added": 1, "last_date": None, "note": ""} for s in symbols]
+
+    monkeypatch.setattr(du.updater, "update_many", slow_update)
+    v0 = du._AUTO["version"]
+    du._AUTO["running"] = True
+    t0 = _t.time()
+    import threading
+    th = threading.Thread(target=du._auto_worker, args=(["FPT"],))
+    th.start()
+    assert _t.time() - t0 < 1 and du._AUTO["running"]          # bắt đầu luồng nền không chờ tải xong
+    gate["go"] = True
+    th.join(5)
+    assert not du._AUTO["running"] and du._AUTO["version"] == v0 + 1   # xong thì hạ cờ và tăng phiên bản để trang làm mới
+
+    def boom(symbols, **kw):
+        raise RuntimeError("mạng lỗi")
+
+    monkeypatch.setattr(du.updater, "update_many", boom)
+    du._AUTO["running"] = True
+    du._auto_worker(["FPT"])
+    assert not du._AUTO["running"]                                # lỗi trong luồng nền không làm kẹt cờ
+
+
+# ---------- hỏi trợ lý: mua bây giờ hay đợi ----------
+def test_ask_average_scenarios_hand_calc_and_guidance():
+    from src import ask
+    sc = {s["name"]: s for s in ask.average_scenarios(100_000.0, 30_000_000.0, 3)}
+    flat = sc["Chia 3 lần, giá đi ngang"]
+    now = sc["Mua hết một lần hôm nay"]
+    assert abs(flat["avg"] - now["avg"]) < 1e-6                       # giá đi ngang: chia hay không giá vốn như nhau
+    assert sc["Chia 3 lần, giá giảm dần 5% mỗi lần"]["avg"] < now["avg"] < sc["Chia 3 lần, giá tăng dần 5% mỗi lần"]["avg"]
+    # đang giữ 100 cp giá vốn 120.000, mua thêm 10 triệu ở giá 100.000 (phí 0,15%): giá vốn mới phải thấp hơn 120.000 và cao hơn 100.000
+    held = ask.average_scenarios(100_000.0, 10_000_000.0, 1, 100, 120_000.0)[0]
+    exp_qty = 10_000_000 / (100_000 * 1.0015)
+    assert abs(held["avg"] - (100 * 120_000 + 10_000_000) / (100 + exp_qty)) < 1e-6 and 100_000 < held["avg"] < 120_000
+    n = 300
+    hot = pd.DataFrame({"close": np.concatenate([np.full(250, 50_000.0), np.linspace(50_000, 80_000, 50)])})
+    f = ask.facts(hot)
+    assert f["rsi"] > 70 and any("chia nhỏ" in g["text"] for g in ask.guidance(f))
+    fall = pd.DataFrame({"close": np.linspace(100_000, 60_000, n)})
+    assert any("đang giảm" in g["text"] for g in ask.guidance(ask.facts(fall)))
+    g = ask.guidance(ask.facts(fall), held_qty=100, held_avg=100_000.0, weight_after=0.5, max_alloc=0.3)
+    assert any("kéo giá vốn xuống" in x["text"] for x in g) and any("vượt mức 30%" in x["text"] for x in g)
+    assert "Không ai biết giá ngày mai" in g[-1]["text"] and ask.facts(hot.head(20)) is None
+
+
+
+def test_ask_page_streams_answer_and_respects_sharing_choice(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    from src import llm
+    monkeypatch.setenv("TEST_PF", str(tmp_path / "pf.json"))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    portfolio.save({"holdings": [{"symbol": "FPT", "qty": 100, "avg_cost": 100_000.0}], "cash": 2_000_000.0}, "manual", tmp_path / "pf.json")
+    script = str(Path(__file__).resolve().parent / "ui_ask_app.py")
+    at = AppTest.from_file(script, default_timeout=60).run()
+    assert not at.exception
+    if not any("Hỏi AI" in b.label for b in at.button):              # không có dữ liệu giá thật cho mã: trang báo thiếu dữ liệu, không lỗi
+        return
+    sent = {}
+    real = llm.chat_stream
+    monkeypatch.setattr(llm, "chat_stream", lambda q, h, d: sent.update(d) or real(q, h, d))
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)            # không chờ nhịp gõ chữ khi test
+    at.text_area(key="ask_q").set_value("Giờ mua có ổn không?").run()
+    next(b for b in at.button if "Hỏi AI" in b.label).click().run()
+    assert not at.exception and "so_tien_dinh_mua" not in sent and "gia_von_binh_quan" not in sent   # mặc định không gửi số tiền, danh mục
+    assert "MẪU" in at.session_state["ask_ans"][1]                    # câu trả lời được lưu để hiện lại ở lần chạy sau
+    at.run()
+    assert not at.exception and any("MẪU" in m.value for m in at.markdown)
+    sent.clear()
+    at.toggle(key="ask_share").set_value(True).run()
+    next(b for b in at.button if "Hỏi AI" in b.label).click().run()
+    assert sent.get("gia_von_binh_quan") == 100_000 and sent.get("so_co_phieu_dang_giu") == 100   # người dùng cho phép thì mới gửi
+
+
+
+# ---------- chatbot đọc toàn bộ dữ liệu ----------
+def _chat_inputs(tmp_path, n_closed=3, reason="mua vì tin đồn"):
+    from src import dividends as dv, cashflow as cfm
+    jdb, cdb, ddb, pfp = tmp_path / "j.db", tmp_path / "c.db", tmp_path / "d.db", tmp_path / "pf.json"
+    o = journal.add_trade("FPT", 100, 100_000, 0, 120_000, reason, "2026-03-02", jdb)
+    journal.update_trade(o, jdb, tags="Mua vì tin đồn|Không đặt cắt lỗ")
+    for i in range(n_closed):
+        a = journal.add_trade("VNM", 100, 60_000, 57_000, None, f"lý do {i} " + "x" * 150, "2026-02-01", jdb)
+        journal.close_trade(a, 61_000, "2026-02-20", "ghi chú", jdb)
+    portfolio.save({"holdings": [{"symbol": "FPT", "qty": 100, "avg_cost": 100_000.0}], "cash": 2_000_000.0}, "manual", pfp)
+    cfm.add("2026-01-05", 10_000_000, "vốn đầu", cdb)
+    dv.add("2026-06-01", "FPT", dv.CASH, 100_000, "", False, ddb, pfp)
+    pf = portfolio.load(pfp)
+    val, vs = portfolio.valuate(pf, lambda s: 90_000.0)
+    flows = cfm.list_flows(cdb)
+    return dict(now=pd.Timestamp("2026-11-05 10:00"), settings={"capital_m": 10.0, "risk_pct": 2.0, "max_alloc": 30, "watch": ["FPT"]},
+                valuation=val, val_summary=vs, pf_cash=pf["cash"], trades=journal.list_trades(jdb), flows=flows,
+                cf_summary=cfm.summary(flows, vs["total"], date(2026, 11, 5)), divs=dv.list_all(ddb), div_summary=dv.summary(dv.list_all(ddb), 1e7),
+                bench=None, snaps=[{"symbol": "FPT", "close": 90_000.0, "change": 0.01, "score": 55.0, "rsi": 52.0, "last_date": pd.Timestamp("2026-11-05"), "partial": True}],
+                alert_items=[{"message": "FPT gần cắt lỗ"}], risk_summary=None, news={"FPT": [{"source": "X", "title": "FPT báo lãi", "link": "l"}]},
+                last_data_date=pd.Timestamp("2026-11-05"))
+
+
+def test_chat_context_contains_everything_and_no_secrets(tmp_path, monkeypatch):
+    from src import chat_context as cc
+    monkeypatch.setenv("OPENAI_COMPAT_API_KEY", "SECRET-KEY-123")
+    monkeypatch.setenv("APP_PIN", "9876")
+    ctx = cc.compose(**_chat_inputs(tmp_path))
+    text = json.dumps(ctx, ensure_ascii=False)
+    assert ctx["danh_muc"]["dang_giu"][0]["gia_von"] == 100_000 and ctx["danh_muc"]["dang_giu"][0]["gia_hien_tai"] == 90_000
+    assert ctx["lenh_dang_giu_trong_nhat_ky"][0]["ly_do"] == "mua vì tin đồn" and ctx["lenh_dang_giu_trong_nhat_ky"][0]["cat_lo"] is None
+    assert "Không đặt cắt lỗ" in ctx["lenh_dang_giu_trong_nhat_ky"][0]["the"] and len(ctx["lenh_da_ban_gan_day"]) == 3
+    assert ctx["tien_nap_rut"]["tom_tat"]["tien_rong_da_bo_vao"] == 10_000_000 and ctx["co_tuc"]["tong_tien_mat_da_nhan"] == 100_000
+    assert ctx["gia_thi_truong"][0]["tam_thoi"] is True and ctx["tin_tuc_nhac_dich_danh_ma"]["FPT"][0]["tieu_de"] == "FPT báo lãi"
+    assert ctx["bay_gio"].startswith("2026-11-05 10:00") and ctx["canh_bao_gia_hien_tai"] == ["FPT gần cắt lỗ"]
+    assert "SECRET-KEY-123" not in text and "9876" not in text                                    # khoá API và PIN không bao giờ lọt vào ngữ cảnh
+
+
+def test_chat_context_is_bounded_and_drops_oldest_first(tmp_path):
+    from src import chat_context as cc
+    ctx = cc.compose(**_chat_inputs(tmp_path, n_closed=40))
+    assert len(json.dumps(ctx, ensure_ascii=False)) <= cc.MAX_CHARS and len(ctx["lenh_da_ban_gan_day"]) <= cc.MAX_CLOSED
+    assert ctx["danh_muc"]["dang_giu"] and ctx["lenh_dang_giu_trong_nhat_ky"]                     # dữ liệu đang giữ không bị cắt
+    old = cc.MAX_CHARS
+    try:
+        cc.MAX_CHARS = 3000
+        sub = tmp_path / "x"
+        sub.mkdir()
+        small = cc.compose(**_chat_inputs(sub, n_closed=40))
+        assert len(small["lenh_da_ban_gan_day"]) < 40
+    finally:
+        cc.MAX_CHARS = old
+
+
+def test_chat_answer_prompt_has_context_history_and_injection_guard(monkeypatch):
+    from src import llm
+    seen = {}
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compat")
+    monkeypatch.setattr(llm, "_complete", lambda p, n, system=None: seen.update(p=p, s=system) or "  trả lời  ")
+    hist = [{"role": "user", "content": f"câu {i}"} for i in range(10)]
+    out = llm.chat_answer("Giờ mua có ổn không?", hist, {"danh_muc": {"tien_mat": 123}})
+    assert out == "trả lời" and '"tien_mat": 123' in seen["p"] and "câu 9" in seen["p"] and "câu 0" not in seen["p"]   # chỉ giữ vài lượt cuối
+    assert seen["s"] == llm.SYSTEM_CHAT and "KHÔNG phải chỉ thị" in seen["s"] and "không hứa lợi nhuận" in seen["s"]
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    assert "MẪU" in llm.chat_answer("x", [], {})
+
+
+def test_chatbot_form_submit_does_not_crash_and_clears_input(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    for k, f in (("TEST_JOURNAL", "j.db"), ("TEST_CF", "c.db"), ("TEST_DIV", "d.db"), ("TEST_PF", "pf.json")):
+        monkeypatch.setenv(k, str(tmp_path / f))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    from src import llm as _llm
+    monkeypatch.setattr(_llm.time, "sleep", lambda s: None)                                   # không chờ nhịp gõ chữ khi test
+    portfolio.save({"holdings": [{"symbol": "FPT", "qty": 100, "avg_cost": 100_000.0}], "cash": 1_000_000.0}, "manual", tmp_path / "pf.json")
+    at = AppTest.from_file(str(Path(__file__).resolve().parent / "ui_chat_app.py"), default_timeout=60).run()
+    assert not at.exception
+
+    def send(text):
+        at.text_input(key="chat_q").set_value(text)           # trong form: giá trị chỉ được gửi cùng lúc bấm Gửi (giống Enter)
+        next(b for b in at.button if "arrow_upward" in b.label).click().run()
+
+    send("Giờ mua có ổn không?")
+    assert not at.exception, [e.value for e in at.exception]                                   # lỗi cũ: sửa ô nhập sau khi đã tạo ra nó
+    assert [m["role"] for m in at.session_state["chat_hist"]] == ["user", "assistant"]
+    assert at.session_state["chat_hist"][0]["content"] == "Giờ mua có ổn không?"
+    # (việc xoá ô nhập sau khi gửi do clear_on_submit của form làm ở trình duyệt, AppTest không mô phỏng; đã kiểm tra bằng trình duyệt thật)
+    send("   ")                                                                                # câu hỏi trống: bỏ qua, không lỗi
+    assert not at.exception and len(at.session_state["chat_hist"]) == 2
+    send("Hỏi tiếp")
+    assert not at.exception and len(at.session_state["chat_hist"]) == 4
+    next(b for b in at.button if "delete_sweep" in b.label).click().run()                   # nút xoá cuộc trò chuyện
+    assert not at.exception and at.session_state["chat_hist"] == []
+    next(b for b in at.button if "Giờ mua thêm" in b.label).click().run()                     # câu gợi ý cũng gửi được, không lỗi
+    assert not at.exception and len(at.session_state["chat_hist"]) == 2
+
+
+# ---------- tối ưu: stream chat, tạo file khi bấm ----------
+def test_sse_chunks_parse_and_chat_stream_mock(monkeypatch):
+    from src import llm
+    lines = [b": keepalive", b'data: {"choices":[{"delta":{"role":"assistant"}}]}', 'data: {"choices":[{"delta":{"content":"Xin "}}]}'.encode(),
+             b"data: khong phai json", 'data: {"choices":[{"delta":{"content":"chào"}}]}'.encode(), b"", b"data: [DONE]",
+             'data: {"choices":[{"delta":{"content":"BỎ"}}]}'.encode()]
+    assert "".join(llm._sse_chunks(lines)) == "Xin chào"                       # bỏ dòng rác, dừng ở [DONE]
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    assert "".join(llm.chat_stream("x", [], {})).strip() == llm.chat_answer("x", [], {}).strip()
+    assert len(list(llm.chat_stream("x", [], {}))) > 3                         # trả về nhiều đoạn nhỏ, không phải một cục
+
+
+def test_chat_stream_openai_compat_sends_stream_flag_and_system_prompt(monkeypatch):
+    import requests
+    from src import llm
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compat")
+    monkeypatch.setenv("OPENAI_COMPAT_BASE_URL", "http://x/v1")
+    seen = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def raise_for_status(self): pass
+        def iter_lines(self): return iter([b'data: {"choices":[{"delta":{"content":"ok"}}]}', b"data: [DONE]"])
+
+    monkeypatch.setattr(requests, "post", lambda url, **kw: seen.update(url=url, **kw) or FakeResp())
+    assert "".join(llm.chat_stream("Giờ mua?", [], {"a": 1})) == "ok"
+    assert seen["url"].endswith("/chat/completions") and seen["json"]["stream"] is True
+    assert seen["json"]["messages"][0]["content"] == llm.SYSTEM_CHAT and '"a": 1' in seen["json"]["messages"][1]["content"]
+
+
+def test_downloads_are_generated_lazily(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    from src import report
+    calls = {"xl": 0}
+    real = report.to_excel
+    monkeypatch.setattr(report, "to_excel", lambda d: calls.__setitem__("xl", calls["xl"] + 1) or real(d))
+    for k, f in (("TEST_PF", "pf.json"),):
+        monkeypatch.setenv(k, str(tmp_path / f))
+    script = tmp_path / "rep_app.py"
+    script.write_text(f"import sys\nsys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
+                      "from views import shared, report_view\nshared.init_state()\nreport_view.render(shared.get_ctx())\n", encoding="utf-8")
+    at = AppTest.from_file(str(script), default_timeout=60).run()
+    assert not at.exception and calls["xl"] == 0                                # hiển thị trang không tạo file Excel; chỉ tạo khi bấm tải
+
+
+# ---------- tỷ lệ tính trên vốn khi chỉ đầu tư một phần ----------
+def test_weights_use_capital_when_only_part_is_invested():
+    from src import risk_table
+    pf = {"holdings": [{"symbol": "ACB", "qty": 400, "avg_cost": 22_000.0}], "cash": 0.0}
+    price = lambda s: 23_000.0
+    df0, s0 = portfolio.valuate(pf, price, 0.30)                                      # không đặt vốn: như cũ, ACB chiếm 100%
+    assert abs(df0["weight"].iloc[0] - 1.0) < 1e-9 and any("chiếm 100%" in w for w in s0["warnings"]) and s0["assumed_cash"] == 0
+    df, s = portfolio.valuate(pf, price, 0.30, capital=58_300_000.0)                  # đặt vốn 58,3 triệu: chỉ đầu tư một phần
+    assert abs(df["weight"].iloc[0] - 9_200_000 / 58_300_000) < 1e-9
+    assert s["base"] == 58_300_000 and abs(s["assumed_cash"] - (58_300_000 - 9_200_000)) < 1e-6 and s["total"] == 9_200_000   # `total` vẫn là số đã ghi
+    assert s["warnings"] == []                                                        # không còn "chiếm 100%" hay "tiền mặt dưới 5%"
+    big, sb = portfolio.valuate(pf, price, 0.30, capital=5_000_000.0)                 # vốn nhỏ hơn số đã ghi: lấy số đã ghi, không âm
+    assert sb["base"] == 9_200_000 and sb["assumed_cash"] == 0 and abs(big["weight"].iloc[0] - 1.0) < 1e-9
+    # vẫn cảnh báo khi thật sự dồn quá nhiều so với vốn
+    pf2 = {"holdings": [{"symbol": "ACB", "qty": 400, "avg_cost": 22_000.0}], "cash": 0.0}
+    _, s2 = portfolio.valuate(pf2, lambda x: 23_000.0, 0.30, capital=20_000_000.0)
+    assert any("chiếm 46%" in w for w in s2["warnings"])
+    rt, rs = risk_table.build(df, None, 0.0, 2.0, capital=58_300_000.0)
+    assert abs(rs["total"] - 58_300_000) < 1e-6 and abs(rs["cash_pct"] - (1 - 9_200_000 / 58_300_000)) < 1e-9 and abs(rt["weight"].iloc[0] - 9_200_000 / 58_300_000) < 1e-9
+    rt0, rs0 = risk_table.build(df0, None, 0.0, 2.0)                                  # không đặt vốn: như cũ
+    assert rs0["total"] == 9_200_000 and rs0["cash_pct"] == 0
+
+
+def test_todo_does_not_warn_cash_gone_when_capital_covers_it():
+    from datetime import date
+    from src import todo
+    today = date(2026, 11, 5)
+    s = {"total": 9.2e6, "base": 58.3e6, "assumed_cash": 49.1e6, "cash": 0.0}
+    assert todo.build([], None, today, today, s, {"ACB": 0.158}, 0.30, True, True) == []
+    s_old = {"total": 9.2e6, "cash": 0.0}                                              # không có vốn: vẫn cảnh báo như cũ
+    assert any("Tiền mặt" in i["title"] for i in todo.build([], None, today, today, s_old, {"ACB": 1.0}, 0.30, True, True))
+
+
+def test_smooth_splits_big_chunks_into_words_without_changing_text():
+    from src import llm
+    sleeps = []
+    big = ["Xin chào các bạn, hôm nay thị trường ", "đi ngang và thanh khoản thấp.\nCẩn thận nhé"]
+    out = list(llm.smooth(iter(big), sleeper=sleeps.append))
+    assert "".join(out) == "".join(big) and len(out) > 8                       # cùng nội dung, nhưng nhả từng từ chứ không cả cục
+    assert all(s <= 0.03 + 1e-9 for s in sleeps) and sum(sleeps) <= 1.5 * len(big) + 1e-6   # mỗi từ chờ ngắn; mỗi cục không quá 1,5 giây
+    assert list(llm.smooth(iter(["", "ok"]), sleeper=lambda s: None)) == ["ok"] and list(llm.smooth(iter([]))) == []
+
+
+# ---------- chat không mất tin nhắn khi bị ngắt ----------
+def test_chat_tee_keeps_partial_answer_when_interrupted():
+    from views import chatbot
+
+    class Interrupted(BaseException):      # giống RerunException của Streamlit: không phải Exception thường
+        pass
+
+    def pieces():
+        yield "Xin "
+        yield "chào "
+        raise Interrupted()
+
+    entry = {"role": "assistant", "content": "", "partial": True}
+    got = []
+    with pytest.raises(Interrupted):
+        for p in chatbot._tee(entry, pieces()):
+            got.append(p)
+    assert got == ["Xin ", "chào "] and entry["content"] == "Xin chào " and entry["partial"] is True   # phần đã có vẫn được giữ, đánh dấu chưa xong
+
+
+def test_chat_question_saved_immediately_and_finished_answer_not_partial(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    from src import llm
+    for k, f in (("TEST_JOURNAL", "j.db"), ("TEST_CF", "c.db"), ("TEST_DIV", "d.db"), ("TEST_PF", "pf.json")):
+        monkeypatch.setenv(k, str(tmp_path / f))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    portfolio.save({"holdings": [], "cash": 1_000_000.0}, "manual", tmp_path / "pf.json")
+    at = AppTest.from_file(str(Path(__file__).resolve().parent / "ui_chat_app.py"), default_timeout=60).run()
+    at.text_input(key="chat_q").set_value("Câu 1")
+    next(b for b in at.button if "arrow_upward" in b.label).click().run()
+    h = at.session_state["chat_hist"]
+    assert [m["role"] for m in h] == ["user", "assistant"] and "partial" not in h[1] and h[1]["content"]
+    assert at.session_state["chat_busy_until"] == 0.0                                            # xong thì mở lại việc tự làm mới trang
+    # lượt sau: lịch sử gửi cho AI không chứa tin nhắn dở dang
+    h.append({"role": "user", "content": "Câu dở"})
+    h.append({"role": "assistant", "content": "chưa xong", "partial": True})
+    seen = {}
+    real = llm.chat_stream
+    monkeypatch.setattr(llm, "chat_stream", lambda q, hist, ctx: seen.update(hist=list(hist)) or real(q, hist, ctx))
+    at.text_input(key="chat_q").set_value("Câu 2")
+    next(b for b in at.button if "arrow_upward" in b.label).click().run()
+    assert not at.exception and all(not m.get("partial") for m in seen["hist"]) and not any(m["content"] == "chưa xong" for m in seen["hist"])
+
+
+def test_user_bubble_escapes_html(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    for k, f in (("TEST_JOURNAL", "j.db"), ("TEST_CF", "c.db"), ("TEST_DIV", "d.db"), ("TEST_PF", "pf.json")):
+        monkeypatch.setenv(k, str(tmp_path / f))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    from src import llm
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    portfolio.save({"holdings": [], "cash": 1_000_000.0}, "manual", tmp_path / "pf.json")
+    at = AppTest.from_file(str(Path(__file__).resolve().parent / "ui_chat_app.py"), default_timeout=60).run()
+    at.text_input(key="chat_q").set_value('<img src=x onerror=alert(1)> & "ok"')
+    next(b for b in at.button if "arrow_upward" in b.label).click().run()
+    assert not at.exception
+    html_blocks = [m.value for m in at.markdown if "chat-u" in m.value]
+    assert html_blocks and "<img" not in html_blocks[0] and "&lt;img" in html_blocks[0] and "&amp;" in html_blocks[0]   # câu hỏi của bạn không bao giờ chạy như HTML
+
+
+# ---------- lưu lịch sử chat, số liệu AI tính sẵn, sao lưu tự động ----------
+def test_chat_store_roundtrip_sanitises_and_survives_corruption(tmp_path):
+    from src import chat_store
+    p = tmp_path / "chat.json"
+    hist = [{"role": "user", "content": "Xin chào"}, {"role": "assistant", "content": "Chào bạn", "partial": True}]
+    chat_store.save(hist, p)
+    assert chat_store.load(p) == hist
+    chat_store.save([{"role": "hacker", "content": "x"}, {"role": "user", "content": 5}, "rác", {"role": "user", "content": "a" * 10_000}] + [{"role": "user", "content": str(i)} for i in range(100)], p)
+    got = chat_store.load(p)
+    assert len(got) == chat_store.MAX_MESSAGES and got[-1]["content"] == "99" and all(m["role"] == "user" for m in got)   # bỏ mục sai, giữ tin mới nhất
+    p.write_text("{không phải json", encoding="utf-8")
+    assert chat_store.load(p) == [] and chat_store.load(tmp_path / "khong_co.json") == []                         # file hỏng/không có: bắt đầu lại
+    chat_store.save([], p)
+    assert chat_store.load(p) == []
+
+
+def test_chat_history_reloads_after_page_refresh(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    from src import llm
+    for k, f in (("TEST_JOURNAL", "j.db"), ("TEST_CF", "c.db"), ("TEST_DIV", "d.db"), ("TEST_PF", "pf.json")):
+        monkeypatch.setenv(k, str(tmp_path / f))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    portfolio.save({"holdings": [], "cash": 1_000_000.0}, "manual", tmp_path / "pf.json")
+    script = str(Path(__file__).resolve().parent / "ui_chat_app.py")
+    at = AppTest.from_file(script, default_timeout=60).run()
+    at.text_input(key="chat_q").set_value("Câu hỏi cần nhớ")
+    next(b for b in at.button if "arrow_upward" in b.label).click().run()
+    assert (tmp_path / "chat_history.json").exists()
+    fresh = AppTest.from_file(script, default_timeout=60).run()                      # phiên mới = tải lại trang
+    assert [m["content"] for m in fresh.session_state["chat_hist"]][0] == "Câu hỏi cần nhớ" and len(fresh.session_state["chat_hist"]) == 2
+    next(b for b in fresh.button if "delete_sweep" in b.label).click().run()          # nút xoá cũng xoá file
+    assert fresh.session_state["chat_hist"] == [] and AppTest.from_file(script, default_timeout=60).run().session_state["chat_hist"] == []
+
+
+def test_chat_context_has_precomputed_labeled_numbers(tmp_path):
+    from src import chat_context as cc
+    inp = _chat_inputs(tmp_path)
+    # thêm một mã đang giữ nhưng KHÔNG có trong nhật ký
+    inp["valuation"] = pd.concat([inp["valuation"], pd.DataFrame([{"symbol": "VPB", "qty": 200, "avg_cost": 25_000.0, "price": 22_000.0, "price_src": "dữ liệu giá của bạn",
+                                                                  "value": 4_400_000.0, "cost": 5_000_000.0, "pnl": -600_000.0, "pnl_pct": -0.12, "net_pnl": -610_000.0, "weight": 0.3}])], ignore_index=True)
+    inp["val_summary"] = {**inp["val_summary"], "base": 50_000_000.0, "assumed_cash": 30_000_000.0, "pnl": -2_000_000.0, "pnl_pct": -0.1, "stock_value": 14_000_000.0}
+    ctx = cc.compose(**inp)
+    p = ctx["so_lieu_da_tinh_san"]
+    assert p["ma_dang_giu_nhung_CHUA_co_lenh_trong_nhat_ky"] == ["VPB"]                 # VPB không có trong nhật ký
+    assert p["ma_co_lenh_trong_nhat_ky_nhung_CHUA_dat_cat_lo"] == ["FPT"]                # FPT có lệnh nhưng chưa đặt cắt lỗ
+    assert p["lai_lo_cua_phan_co_phieu_so_voi_gia_von_pct"] == -10.0 and p["lai_lo_so_voi_TONG_tai_san_pct"] == -4.0   # hai phép tính khác nghĩa được tách riêng
+    assert p["co_phieu_chiem_pct_tong_tai_san"] == 28.0 and "lai_lo_chua_ban_pct" not in json.dumps(ctx, ensure_ascii=False)
+
+
+def test_auto_backup_once_per_day_rotates_separately_and_never_raises(tmp_path):
+    from datetime import datetime as dtm
+    from src import backup
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    paths = _backup_paths(data_dir)
+    paths["chat_history.json"] = data_dir / "chat_history.json"
+    bk = tmp_path / "bk"
+    backup._CHECKED.clear()
+    assert backup.auto_backup(paths, bk, dtm(2026, 11, 5, 9, 0)) is None and not bk.exists()        # chưa có dữ liệu: không tạo bản rỗng
+    journal.add_trade("FPT", 100, 100_000, 95_000, None, "gốc", "2026-01-05", paths["journal.db"])
+    backup._CHECKED.clear()
+    first = backup.auto_backup(paths, bk, dtm(2026, 11, 5, 9, 0))
+    assert first is not None and first.name.endswith("-tu-dong.zip") and "journal.db" in backup.inspect(first.read_bytes())["files"]
+    assert backup.auto_backup(paths, bk, dtm(2026, 11, 5, 18, 0)) is None                            # cùng ngày: không tạo thêm
+    backup._CHECKED.clear()
+    assert backup.auto_backup(paths, bk, dtm(2026, 11, 5, 18, 0)) is None                            # kể cả khi quên bộ nhớ: thấy file hôm nay trên đĩa
+    for i in range(20):                                                                                # 20 ngày liên tiếp -> chỉ giữ KEEP_AUTO bản tự động
+        backup._CHECKED.clear()
+        (bk / f"sao-luu-202610{i + 1:02d}-090000{backup.AUTO_TAG}.zip").write_bytes(b"x")
+    manual = backup.save_local(paths, bk)
+    backup._rotate(bk)
+    autos = [f for f in bk.glob("sao-luu-*.zip") if f.name.endswith(backup.AUTO_TAG + ".zip")]
+    assert len(autos) == backup.KEEP_AUTO and manual.exists()                                         # bản thủ công không bị bản tự động đẩy đi
+    assert backup.latest_auto(bk).name.startswith("sao-luu-20261105")                                 # tên mới nhất theo ngày
+    backup._CHECKED.clear()
+    blocker = tmp_path / "file.txt"
+    blocker.write_text("là file, không phải thư mục", encoding="utf-8")
+    assert backup.auto_backup(paths, blocker / "x", dtm(2026, 12, 1)) is None                          # thư mục không tạo được: trả None, không ném lỗi
+
+
+# ---------- chatbot biết trang đang xem; sức khoẻ dữ liệu ----------
+def test_describe_page_tells_ai_which_stock_and_numbers_user_is_viewing():
+    from src import chat_context as cc
+    p = cc.describe_page("calc", {"calc_symbol": "fpt", "calc_entry": 120000, "calc_stop": 112000, "calc_target": 140000})
+    assert p["ten_trang"] == "Tính lệnh mua" and p["ma_dang_xem"] == "FPT" and p["thong_so_nguoi_dung_dang_nhap"]["gia_cat_lo"] == 112000
+    assert cc.describe_page("stock", {"symbol": "VNM"})["ma_dang_xem"] == "VNM"
+    assert "ma_dang_xem" not in cc.describe_page("portfolio", {"symbol": "VNM"})          # trang không có khái niệm “mã đang xem”
+    assert cc.describe_page(None, {}) is None and cc.describe_page("trang_la", {}) is None
+
+
+def test_health_check_finds_stale_missing_and_mismatched_data():
+    from datetime import date
+    from src import health
+    today = date(2026, 11, 6)                                                              # thứ Sáu
+    holdings = [{"symbol": "FPT", "qty": 100, "avg_cost": 100_000.0}, {"symbol": "VPB", "qty": 200, "avg_cost": 25_000.0}, {"symbol": "ACB", "qty": 50, "avg_cost": 20_000.0}]
+    trades = pd.DataFrame([{"symbol": "FPT", "qty": 150}, {"symbol": "HPG", "qty": 100}])   # FPT lệch số lượng; HPG không có trong Danh mục
+    dates = {"FPT": date(2026, 11, 2), "VPB": date(2026, 11, 2), "ACB": None}
+    got = health.check(today, holdings, 0.0, "2026-10-20T10:00:00", trades, dates, True, 5e6, 1.2e7, None)
+    titles = " | ".join(i["title"] for i in got)
+    assert "Chưa có giá của ACB" in titles and "Giá đã cũ 4 phiên" in titles and "cách đây 17 ngày" in titles
+    assert "Danh mục chưa ghi tiền mặt" in titles and "FPT: Danh mục và Nhật ký lệch số lượng" in titles
+    assert "HPG: có lệnh mở trong Nhật ký nhưng Danh mục không có" in titles and "VPB: có trong Danh mục nhưng chưa có trong Nhật ký" in titles
+    assert "Vốn ở Cài đặt nhỏ hơn" in titles and "Chưa có bản sao lưu gần đây" in titles
+    assert [i["level"] for i in got] == sorted([i["level"] for i in got], key=lambda l: {"warn": 0, "info": 1}[l])   # cảnh báo xếp trên
+    clean = health.check(today, [{"symbol": "FPT", "qty": 100, "avg_cost": 1.0}], 1e6, "2026-11-05T09:00:00", pd.DataFrame([{"symbol": "FPT", "qty": 100}]),
+                         {"FPT": date(2026, 11, 5)}, True, 2e7, 1.1e7, 0.2)
+    assert clean == []                                                                      # dữ liệu ổn thì không báo gì
+    assert health.check(today, [], 0.0, None, None, {}, False, 0, 0, None, has_data=False) == []   # chưa có dữ liệu: không báo thiếu sao lưu
+
+
+# ---------- ghi lệnh bằng chat: bộ đọc câu ----------
+def test_trade_parse_reads_vietnamese_sentences_and_never_treats_questions_as_trades():
+    from datetime import date
+    from src import trade_parse as tp
+    today = date(2026, 11, 6)
+    d = tp.parse("hôm nay mua 100 FPT giá 120k, cắt lỗ 112k, mục tiêu 140.000 vì báo cáo quý tốt", today)
+    assert (d["side"], d["symbol"], d["qty"], d["price"], d["stop"], d["target"]) == ("buy", "FPT", 100, 120_000, 112_000, 140_000)
+    assert d["reason"] == "báo cáo quý tốt" and d["date"] == today
+    d = tp.parse("Bán 200 cổ phiếu HPG giá 28,5k hôm qua", today)
+    assert (d["side"], d["symbol"], d["qty"], d["price"]) == ("sell", "HPG", 200, 28_500) and d["date"] == date(2026, 11, 5)
+    d = tp.parse("mua 2 lô vcb ở giá 90000 ngày 3/11", today, known=["VCB"])               # tên thường nhận khi là mã đã biết; 1 lô = 100
+    assert (d["symbol"], d["qty"], d["price"], d["date"]) == ("VCB", 200, 90_000, date(2026, 11, 3)) and any("1 lô" in n for n in d["notes"])
+    d = tp.parse("mua FPT 100 cổ giá 120", today)                                           # giá nhỏ không đơn vị: hiểu là nghìn đồng, có ghi chú
+    assert d["price"] == 120_000 and any("nghìn đồng" in n for n in d["notes"])
+    assert tp.parse("mua 100 FPT", today)["price"] is None                                     # thiếu giá: vẫn ra nháp để bạn điền
+    for q in ("Giờ mua 100 FPT có ổn không?", "có nên mua 100 FPT giá 120k", "Tôi nên bán bao nhiêu cổ phiếu FPT", "mua FPT bao nhiêu thì hợp lý",
+              "Danh mục của tôi có rủi ro gì", "mua", "bán hết đi", "mua FPT", "mua 100 giá 120k", "xin chào"):
+        assert tp.parse(q, today) is None, q                                                   # câu hỏi, thiếu mã/số lượng, hay không phải lệnh: không soạn nháp
+    assert tp.parse("mua 100 FPT ngày 30/12/2030 giá 100k", today)["date"] == today            # ngày tương lai bị đưa về hôm nay
+    assert tp.parse_number("120.000") == 120000 and tp.parse_number("28,5", "k") == 28500 and tp.parse_number("1,2", "tr") == 1_200_000
+    assert tp.parse_number("abc") is None and tp.parse_number("") is None
+
+
+def test_chat_trade_draft_requires_confirmation_then_writes_journal(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    from src import llm
+    for k, f in (("TEST_JOURNAL", "j.db"), ("TEST_CF", "c.db"), ("TEST_DIV", "d.db"), ("TEST_PF", "pf.json")):
+        monkeypatch.setenv(k, str(tmp_path / f))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    called = []
+    monkeypatch.setattr(llm, "chat_stream", lambda *a, **k: called.append(1) or iter(["x"]))   # câu ghi lệnh không được gọi AI
+    portfolio.save({"holdings": [], "cash": 1_000_000.0}, "manual", tmp_path / "pf.json")
+    jdb = tmp_path / "j.db"
+    at = AppTest.from_file(str(Path(__file__).resolve().parent / "ui_chat_app.py"), default_timeout=60).run()
+
+    def send(text):
+        at.text_input(key="chat_q").set_value(text)
+        next(b for b in at.button if "arrow_upward" in b.label).click().run()
+        assert not at.exception, [e.value for e in at.exception]
+
+    send("hôm nay mua 100 FPT giá 120k, cắt lỗ 112k, mục tiêu 140k vì báo cáo quý tốt")
+    d = at.session_state["chat_draft"]
+    assert not called and (d["symbol"], d["qty"], d["price"]) == ("FPT", 100, 120_000)
+    assert journal.list_trades(jdb).empty                                                      # CHƯA ghi gì: phải duyệt trước
+    ok = at.button(key=f"chat_d{d['id']}_ok")
+    assert not ok.disabled
+    ok.click().run()
+    assert not at.exception
+    t = journal.list_trades(jdb)
+    assert len(t) == 1 and t.iloc[0]["symbol"] == "FPT" and t.iloc[0]["entry"] == 120_000 and t.iloc[0]["stop"] == 112_000 and "báo cáo quý tốt" in t.iloc[0]["reason"]
+    assert "chat_draft" not in at.session_state and "Đã ghi lệnh MUA FPT" in at.session_state["chat_hist"][-1]["content"]
+    # bán đúng số lượng: đóng lệnh đang mở
+    send("bán 100 FPT giá 130k")
+    d2 = at.session_state["chat_draft"]
+    assert pd.isna(journal.list_trades(jdb).iloc[0]["exit_price"])                                           # vẫn chưa đóng trước khi duyệt
+    at.button(key=f"chat_d{d2['id']}_ok").click().run()
+    assert not at.exception and journal.list_trades(jdb).iloc[0]["exit_price"] == 130_000
+    # bán số lượng không khớp: nút ghi bị khoá, không ghi gì
+    send("bán 50 FPT giá 130k")
+    d3 = at.session_state["chat_draft"]
+    assert at.button(key=f"chat_d{d3['id']}_ok").disabled
+    at.button(key=f"chat_d{d3['id']}_no").click().run()
+    assert "chat_draft" not in at.session_state and "Đã bỏ bản nháp" in at.session_state["chat_hist"][-1]["content"]
+    # câu hỏi có số vẫn đi đường AI, không soạn nháp
+    send("Giờ mua 100 FPT giá 120k có ổn không?")
+    assert called and "chat_draft" not in at.session_state
+
+
+def test_chat_buy_draft_blocks_invalid_inputs(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    for k, f in (("TEST_JOURNAL", "j.db"), ("TEST_CF", "c.db"), ("TEST_DIV", "d.db"), ("TEST_PF", "pf.json")):
+        monkeypatch.setenv(k, str(tmp_path / f))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    portfolio.save({"holdings": [], "cash": 1_000_000.0}, "manual", tmp_path / "pf.json")
+    at = AppTest.from_file(str(Path(__file__).resolve().parent / "ui_chat_app.py"), default_timeout=60).run()
+    at.text_input(key="chat_q").set_value("mua 100 FPT")                                       # thiếu giá và lý do
+    next(b for b in at.button if "arrow_upward" in b.label).click().run()
+    d = at.session_state["chat_draft"]
+    assert at.button(key=f"chat_d{d['id']}_ok").disabled                                      # chưa nhập giá/lý do: không cho ghi
+    at.number_input(key=f"chat_d{d['id']}_price").set_value(120_000.0)
+    at.text_input(key=f"chat_d{d['id']}_reason").set_value("thử nghiệm")
+    at.number_input(key=f"chat_d{d['id']}_stop").set_value(130_000.0)                         # cắt lỗ cao hơn giá mua
+    at.run()
+    assert at.button(key=f"chat_d{d['id']}_ok").disabled and journal.list_trades(tmp_path / "j.db").empty
+    at.number_input(key=f"chat_d{d['id']}_stop").set_value(110_000.0)
+    at.run()
+    assert not at.button(key=f"chat_d{d['id']}_ok").disabled
+
+
+def test_health_flags_holdings_missing_from_empty_journal():
+    from datetime import date
+    from src import health
+    got = health.check(date(2026, 11, 6), [{"symbol": "ACB", "qty": 400, "avg_cost": 22_732.0}], 5e6, "2026-11-06T09:00:00", None, {"ACB": date(2026, 11, 5)}, False, 0, 1.4e7, 0.1)
+    assert [i["title"] for i in got] == ["ACB: có trong Danh mục nhưng chưa có trong Nhật ký"]        # Nhật ký trống hoàn toàn vẫn được báo
+
+
+# ---------- thư mục tự đọc sao kê ----------
+def _inbox_env(tmp_path, monkeypatch):
+    from src import inbox, backup, cashflow, chat_store, dividends, paper, settings as st_
+    d = tmp_path / "data"
+    d.mkdir()
+    for mod, attr, name in ((portfolio, "PATH", "pf.json"), (journal, "DB_PATH", "j.db"), (cashflow, "DB_PATH", "c.db"), (dividends, "DB_PATH", "d.db"),
+                            (paper, "DB_PATH", "p.db"), (st_, "PATH", "s.json"), (chat_store, "PATH", "chat.json"), (backup, "BACKUP_DIR", "bk"), (inbox, "INBOX_DIR", "inbox")):
+        monkeypatch.setattr(mod, attr, d / name)
+    monkeypatch.setattr(inbox, "SETTLE_SECONDS", 0.0)
+    return inbox, d
+
+
+def test_inbox_imports_holdings_file_once_backs_up_first_and_undo_restores(tmp_path, monkeypatch):
+    inbox, d = _inbox_env(tmp_path, monkeypatch)
+    portfolio.save({"holdings": [{"symbol": "VNM", "qty": 50, "avg_cost": 60_000.0}], "cash": 2_000_000.0}, "manual")
+    journal.add_trade("VNM", 50, 60_000, 57_000, None, "lệnh cũ của tôi", "2026-01-05")
+    (d / "inbox").mkdir()
+    f = d / "inbox" / "sao-ke-tcbs.csv"
+    f.write_text("Mã CK,Khối lượng,Giá vốn (đ)\nFPT,100,98500\nHPG,200,24000\n", encoding="utf-8-sig")
+    res = inbox.scan()
+    assert len(res) == 1 and res[0]["ok"] and res[0]["kind"] == "danh mục"
+    pf = portfolio.load()
+    assert {h["symbol"] for h in pf["holdings"]} == {"FPT", "HPG"} and pf["cash"] == 2_000_000.0 and pf["source"] == "import"   # tiền mặt đang có được giữ nguyên
+    syms = set(journal.list_trades()["symbol"])
+    assert {"FPT", "HPG", "VNM"} <= syms                                              # lệnh cũ của bạn không mất
+    assert not f.exists() and any((d / "inbox" / "da-xu-ly").iterdir())               # file được CHUYỂN, không xoá
+    assert any(p.name.endswith("-truoc-nhap.zip") for p in (d / "bk").iterdir())      # đã sao lưu trước khi ghi
+    f.write_text("Mã CK,Khối lượng,Giá vốn (đ)\nFPT,100,98500\nHPG,200,24000\n", encoding="utf-8-sig")   # cùng nội dung lần nữa
+    assert inbox.scan() == [] and len(journal.list_trades()) == 3                      # không xử lý lại, không trùng lệnh
+    out = inbox.undo()                                                                  # hoàn tác
+    assert out and {h["symbol"] for h in portfolio.load()["holdings"]} == {"VNM"} and set(journal.list_trades()["symbol"]) == {"VNM"}
+    assert inbox.undo() is None and inbox.load_state()["undo"] is None
+
+
+def test_inbox_never_touches_data_when_file_unreadable_or_still_being_written(tmp_path, monkeypatch):
+    inbox, d = _inbox_env(tmp_path, monkeypatch)
+    portfolio.save({"holdings": [{"symbol": "VNM", "qty": 50, "avg_cost": 60_000.0}], "cash": 1.0}, "manual")
+    ib = d / "inbox"
+    ib.mkdir()
+    (ib / "rac.csv").write_text("cột lạ A,cột lạ B\n1,2\n3,4\n", encoding="utf-8")
+    (ib / "hong.xlsx").write_bytes(b"day khong phai excel")
+    (ib / "ghi-do.txt").write_text("không phải csv/xlsx", encoding="utf-8")
+    res = inbox.scan()
+    assert len(res) == 2 and all(not r["ok"] for r in res)
+    assert [h["symbol"] for h in portfolio.load()["holdings"]] == ["VNM"] and portfolio.load()["source"] == "manual"   # không đổi gì
+    assert (ib / "rac.csv").exists() and (ib / "hong.xlsx").exists() and (ib / "ghi-do.txt").exists()                  # file vẫn nằm đó
+    assert inbox.scan() == []                                                          # lỗi cũ không báo lặp mỗi lượt quét
+    assert not (d / "bk").exists()                                                      # chưa ghi thì không cần sao lưu
+    monkeypatch.setattr(inbox, "SETTLE_SECONDS", 3600.0)                               # coi như file vừa được ghi dở
+    (ib / "moi.csv").write_text("Mã CK,Khối lượng,Giá vốn (đ)\nFPT,100,98500\n", encoding="utf-8-sig")
+    assert inbox.scan() == [] and [h["symbol"] for h in portfolio.load()["holdings"]] == ["VNM"]
+
+
+def test_inbox_imports_transaction_history_and_pasted_table(tmp_path, monkeypatch):
+    inbox, d = _inbox_env(tmp_path, monkeypatch)
+    (d / "inbox").mkdir()
+    (d / "inbox" / "lich-su.csv").write_text("Ngày giao dịch,Mã CK,Loại lệnh,KL khớp,Giá khớp\n02/01/2026,FPT,Mua,100,100000\n10/02/2026,FPT,Mua,100,110000\n20/03/2026,FPT,Bán,100,120000\n",
+                                              encoding="utf-8-sig")
+    res = inbox.scan()
+    assert res and res[0]["ok"] and res[0]["kind"] == "giao dịch"
+    t = journal.list_trades()
+    assert len(t) == 2 and int(t["exit_price"].notna().sum()) == 1                      # 1 lệnh đã bán (mua trước bán trước), 1 còn giữ
+    h = portfolio.load()["holdings"]
+    assert h[0]["symbol"] == "FPT" and h[0]["qty"] == 100
+    sheets = inbox.read_pasted("Mã CK\tKhối lượng\tGiá vốn\nACB\t400\t22.732\nVPB\t200\t25.000")
+    _, raw, rows, _, kind = inbox.interpret(sheets)
+    assert kind == "danh mục" and {r["symbol"]: r["qty"] for r in rows} == {"ACB": 400, "VPB": 200}
+    with pytest.raises(ValueError):
+        inbox.read_pasted("   ")
+    with pytest.raises(ValueError):
+        inbox.read_pasted("chỉ một dòng chữ không phải bảng")

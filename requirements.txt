@@ -10,3 +10,4 @@ pytest
 # vnstock (bản 5) cài riêng: xem README, mục "Dữ liệu giá"
 watchdog
 openpyxl
+fpdf2

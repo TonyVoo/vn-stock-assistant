@@ -6,7 +6,7 @@ import streamlit as st
 
 from src import charts, explain, llm, news as newsmod, prompts, risk, signals, ui
 from src.data import VN30_DEFAULT
-from views import shared
+from views import screener_view, shared
 
 
 def _assessment(s: dict) -> str:
@@ -26,6 +26,7 @@ def _ret(df: pd.DataFrame, n: int):
 
 
 def render(ctx) -> None:
+    screener_view.render(ctx)
     options = sorted(set(ctx.watchlist) | set(VN30_DEFAULT))
     if st.session_state.get("symbol") not in options:
         st.session_state["symbol"] = options[0]

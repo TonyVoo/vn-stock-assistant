@@ -6,3 +6,6 @@ data/cache/
 data/*.db
 data/portfolio.json
 data/settings.json
+data/backups/
+data/chat_history.json
+data/inbox/

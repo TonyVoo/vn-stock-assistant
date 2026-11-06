@@ -5,14 +5,15 @@ Lý do cần file riêng: Streamlit xoá trạng thái của ô nhập khi bạn
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Dict, Optional
 
 from .data import VN30_DEFAULT
 
-PATH = Path(__file__).resolve().parent.parent / "data" / "settings.json"
-DEFAULTS = {"capital_m": 10.0, "watch": VN30_DEFAULT[:12], "risk_pct": 2.0, "max_alloc": 30}
+PATH = Path(os.getenv("SETTINGS_PATH") or Path(__file__).resolve().parent.parent / "data" / "settings.json")
+DEFAULTS = {"capital_m": 10.0, "watch": VN30_DEFAULT[:12], "risk_pct": 2.0, "max_alloc": 30, "auto_price": True, "simple_mode": False}
 _SYM = re.compile(r"^[A-Z0-9]{2,6}$")
 
 
@@ -42,6 +43,9 @@ def clean(raw: Dict) -> Dict:
                 out[k] = v if k == "risk_pct" else int(v)
         except (TypeError, ValueError):
             pass
+    for k in ("auto_price", "simple_mode"):
+        b = raw.get(k, out[k])
+        out[k] = b if isinstance(b, bool) else out[k]
     return out
 
 

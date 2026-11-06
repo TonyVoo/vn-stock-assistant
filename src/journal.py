@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS trades (
     reason TEXT,
     closed TEXT,
     exit_price REAL,
-    note TEXT
+    note TEXT,
+    tags TEXT
 )
 """
 
@@ -35,6 +36,10 @@ def _conn(path: Optional[Path] = None) -> sqlite3.Connection:
     c = sqlite3.connect(p)
     c.row_factory = sqlite3.Row
     c.execute(SCHEMA)
+    # Nâng cấp bảng cũ KHÔNG mất dữ liệu: chỉ thêm cột còn thiếu (các lệnh hiện có giữ nguyên, thẻ để trống)
+    if "tags" not in {r["name"] for r in c.execute("PRAGMA table_info(trades)")}:
+        c.execute("ALTER TABLE trades ADD COLUMN tags TEXT")
+        c.commit()
     return c
 
 
@@ -58,10 +63,32 @@ def close_trade(trade_id: int, exit_price: float, closed: str, note: str = "",
                   (closed, exit_price, note, trade_id))
 
 
-_EDITABLE = {"symbol", "qty", "entry", "stop", "target", "opened", "reason", "closed", "exit_price", "note"}
+_EDITABLE = {"symbol", "qty", "entry", "stop", "target", "opened", "reason", "closed", "exit_price", "note", "tags"}
+TAG_SEP = "|"
+MAX_TAGS = 8
 _SYM_RE = re.compile(r"^[A-Z0-9]{2,6}$")
 UNKNOWN_DATE = "Không rõ"
 PLACEHOLDER_REASON = "Nhập từ sao kê"
+
+
+def split_tags(s) -> List[str]:
+    if s is None or (isinstance(s, float) and s != s):  # NULL trong CSDL có thể đọc thành NaN: không được thành chữ “nan”
+        return []
+    return [t for t in str(s).split(TAG_SEP) if t.strip()]
+
+
+def normalize_tags(tags) -> str:
+    """Thẻ -> chuỗi lưu trữ: bỏ trùng/rỗng, tối đa 8 thẻ, mỗi thẻ tối đa 40 ký tự, không chứa ký tự phân cách."""
+    items = tags if isinstance(tags, (list, tuple, set)) else split_tags(tags)
+    out, seen = [], set()
+    for t in items:
+        t = str(t).replace(TAG_SEP, " ").strip()[:40]
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    if len(out) > MAX_TAGS:
+        raise ValueError(f"Tối đa {MAX_TAGS} thẻ cho mỗi lệnh.")
+    return TAG_SEP.join(out)
 
 
 def get_trade(trade_id: int, path: Optional[Path] = None) -> Optional[Dict]:
@@ -122,9 +149,10 @@ def update_trade(trade_id: int, path: Optional[Path] = None, **fields) -> None:
         text = str(fields["reason"] or "").strip()
         m = _IMPORT_KEY.search(cur["reason"] or "")
         reason = (f"[sao kê {m.group(1)}] " if m else "") + text  # giữ khoá nhận diện để nhập lại file không bị trùng
+    tags = normalize_tags(fields["tags"]) if "tags" in fields else (cur.get("tags") or "")
     with _conn(path) as c:
-        c.execute("UPDATE trades SET symbol=?, qty=?, entry=?, stop=?, target=?, opened=?, reason=?, closed=?, exit_price=?, note=? WHERE id=?",
-                  (sym, qty, entry, stop, target, opened, reason, closed, exit_price, new["note"], int(trade_id)))
+        c.execute("UPDATE trades SET symbol=?, qty=?, entry=?, stop=?, target=?, opened=?, reason=?, closed=?, exit_price=?, note=?, tags=? WHERE id=?",
+                  (sym, qty, entry, stop, target, opened, reason, closed, exit_price, new["note"], tags, int(trade_id)))
 
 
 def reopen_trade(trade_id: int, path: Optional[Path] = None) -> None:

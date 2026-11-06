@@ -1,6 +1,7 @@
 """Thu thập tin tức (RSS) và số liệu thị trường thế giới."""
 from __future__ import annotations
 
+import re
 from typing import Dict, List
 
 import feedparser
@@ -51,6 +52,22 @@ def filter_news(items: List[Dict], symbols: List[str]) -> List[Dict]:
         if any(k.lower() in text.split() or f" {k.lower()} " in f" {text} " for k in keys) \
                 or any(m in text for m in macro):
             out.append(it)
+    return out
+
+
+def match_symbol(items: List[Dict], symbol: str, limit: int = 5) -> List[Dict]:
+    """Chỉ giữ tin NHẮC ĐÍCH DANH mã (viết hoa, đứng riêng như một từ) trong tiêu đề hoặc tóm tắt; bỏ trùng; không đoán tin liên quan."""
+    sym = symbol.upper().strip()
+    pat = re.compile(rf"(?<![A-Za-z0-9]){re.escape(sym)}(?![A-Za-z0-9])")
+    out, seen = [], set()
+    for it in items:
+        key = it.get("link") or it.get("title")
+        if key in seen or not pat.search(it.get("title", "") + " " + it.get("summary", "")):
+            continue
+        seen.add(key)
+        out.append(it)
+        if len(out) >= limit:
+            break
     return out
 
 

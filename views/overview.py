@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from src import charts, explain, journal, llm, news as newsmod, ui
-from views import data_update, shared
+from views import data_update, shared, today
 
 ORDER = {"up": 0, "flat": 1, "down": 2, "muted": 3}
 
@@ -143,7 +143,8 @@ def render(ctx) -> None:
     with c3:
         ui.stat_card("Mã đang tăng", f"{groups['up']}/{len(snaps)}", "Trong danh sách theo dõi", "up" if groups["up"] else "")
 
-    ui.section("Nên làm gì hôm nay?", "Không việc nào bắt buộc; không mua cũng là một lựa chọn tốt")
+    today.render(ctx)
+    ui.section("Quy trình mỗi ngày", "Không việc nào bắt buộc; không mua cũng là một lựa chọn tốt")
     ui.steps(["Đọc <b>Bản tin hôm nay</b> bên dưới để biết thị trường có gì mới.",
               "Bấm vào một mã trong danh sách để xem tình hình và hiểu vì sao nó đang tăng/giảm.",
               "Nếu muốn mua, vào <b>Tính lệnh mua</b> để biết nên mua bao nhiêu cổ phiếu cho an toàn.",

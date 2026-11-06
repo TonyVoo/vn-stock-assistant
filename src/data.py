@@ -16,6 +16,7 @@ import pandas as pd
 import requests
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
+CACHE_MAX_AGE = 15 * 60  # giây
 CSV_DIR = Path(os.getenv("PRICES_DIR") or Path(__file__).resolve().parent.parent / "data" / "prices")  # PRICES_DIR: đổi thư mục giá khi thử
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
@@ -135,7 +136,7 @@ def get_prices(symbol: str, days: int = 400) -> Tuple[pd.DataFrame, str]:
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache = CACHE_DIR / f"{symbol}_{pd.Timestamp.today():%Y%m%d}.csv"
-    if cache.exists():
+    if cache.exists() and (time.time() - cache.stat().st_mtime) < CACHE_MAX_AGE:  # bộ nhớ đệm cho mã chưa có file CSV: chỉ 15 phút, không cả ngày
         df = pd.read_csv(cache, parse_dates=["date"])
         return df, "cache"
 

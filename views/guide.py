@@ -4,6 +4,7 @@ from __future__ import annotations
 import streamlit as st
 
 from src import ui
+from views import glossary_ui
 
 GLOSSARY = [
     ("Cổ phiếu / Mã", "Phần sở hữu nhỏ trong một công ty. Mỗi công ty có một mã gồm 3 chữ cái, ví dụ FPT, VCB."),
@@ -70,6 +71,15 @@ def render(ctx) -> None:
              "Giá của phiên hôm nay là ảnh chụp tại lúc bạn cập nhật; trong giờ giao dịch (9:00 đến 14:45) nó còn thay đổi trên sàn và app chưa thấy, "
              "nên cập nhật sau 15:05 để có giá đóng cửa. Dải chỉ số thế giới tự làm mới tối đa mỗi 15 phút và có thể chậm. "
              "Nút cập nhật chỉ tải phần mới và gộp vào dữ liệu có sẵn, không làm mất lịch sử.")
+
+    st.markdown("### Từ điển")
+    glossary_ui.full()
+
+    st.markdown("### Phân tích nhật ký, cổ tức, mua dần và báo cáo tháng")
+    st.write("**Nhật ký** cho phép gắn thẻ lỗi cho từng lệnh (ví dụ “Mua vì tin đồn”) và so sánh kết quả theo thẻ, theo thời gian giữ; nên có khoảng 20 lệnh đã bán thì số liệu mới đáng tin. "
+             "**Cổ tức** (trang Danh mục) ghi cổ tức tiền mặt hoặc cổ phiếu thưởng để lãi thật chính xác hơn. "
+             "**Mua dần** tính mỗi tháng nên mua mã nào, bao nhiêu cổ phiếu với số tiền cố định; đây là kế hoạch, không đảm bảo có lãi. "
+             "**Báo cáo tháng** xuất Excel hoặc PDF để lưu lại.")
 
     st.markdown("### Bảng rủi ro danh mục")
     st.write("Ở trang **Danh mục**, mục “Rủi ro danh mục” cho biết nếu giá giảm bạn có thể mất thêm bao nhiêu. Nó lấy mức cắt lỗ từ các lệnh đang giữ trong "

@@ -365,8 +365,11 @@ def parse_file(raw: pd.DataFrame) -> Tuple[List[Dict], List[str], str]:
 
 
 # ---------------------------------------------------------------- định giá
-def valuate(pf: Dict, last_price: Callable[[str], Optional[float]], max_alloc: float = 0.30) -> Tuple[pd.DataFrame, Dict]:
-    """Định giá danh mục. Thứ tự giá: giá đóng cửa trong dữ liệu của bạn -> giá thị trường do TCBS báo -> giá vốn."""
+def valuate(pf: Dict, last_price: Callable[[str], Optional[float]], max_alloc: float = 0.30, capital: float = 0.0) -> Tuple[pd.DataFrame, Dict]:
+    """Định giá danh mục. Thứ tự giá: giá đóng cửa trong dữ liệu của bạn -> giá thị trường do TCBS báo -> giá vốn.
+
+    capital: vốn/tổng tài sản bạn đặt ở Cài đặt. Bạn thường chỉ đầu tư MỘT PHẦN, phần còn lại chưa ghi trong Danh mục. Mọi tỷ lệ % (tỷ trọng, tiền mặt) tính trên
+    base = max(cổ phiếu + tiền mặt đã ghi, capital); phần chênh lệch coi là tiền chưa đầu tư (assumed_cash). `total` vẫn là số đã ghi trong Danh mục."""
     rows = []
     for h in pf["holdings"]:
         p, src = last_price(h["symbol"]), "dữ liệu giá của bạn"
@@ -385,7 +388,9 @@ def valuate(pf: Dict, last_price: Callable[[str], Optional[float]], max_alloc: f
     df = pd.DataFrame(rows, columns=["symbol", "qty", "avg_cost", "price", "price_src", "value", "cost", "pnl", "pnl_pct", "net_pnl"])
     stock_value = float(df["value"].sum()) if len(df) else 0.0
     total = stock_value + pf["cash"]
-    df["weight"] = df["value"] / total if total else 0.0
+    base = max(total, float(capital or 0.0))
+    assumed = base - total
+    df["weight"] = df["value"] / base if base else 0.0
     known = df[df["pnl"].notna()]
     cost_known = float(known["cost"].sum())
     pnl_known = float(known["pnl"].sum()) if len(known) else 0.0
@@ -395,9 +400,9 @@ def valuate(pf: Dict, last_price: Callable[[str], Optional[float]], max_alloc: f
             warnings.append(f"{r.symbol} chiếm {r.weight * 100:.0f}% tổng tài sản, vượt mức {max_alloc * 100:.0f}% bạn đặt cho một mã.")
         if r.price_src.startswith("giá vốn"):
             warnings.append(f"{r.symbol}: chưa có giá thị trường, đang tạm tính theo giá vốn.")
-    if total and pf["cash"] / total < 0.05 and len(df):
+    if base and (pf["cash"] + assumed) / base < 0.05 and len(df):
         warnings.append("Tiền mặt dưới 5% tổng tài sản: gần như không còn dư địa khi cần mua thêm hoặc chịu biến động.")
-    summary = {"total": total, "stock_value": stock_value, "cash": pf["cash"], "pnl": pnl_known,
+    summary = {"total": total, "base": base, "assumed_cash": assumed, "stock_value": stock_value, "cash": pf["cash"], "pnl": pnl_known,
                "pnl_pct": (pnl_known / cost_known if cost_known else None), "n": len(df), "warnings": warnings,
                "net_pnl": float(known["net_pnl"].sum()) if len(known) else 0.0}
     return df, summary

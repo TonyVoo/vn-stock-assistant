@@ -8,6 +8,7 @@ import streamlit as st
 
 from src import explain, llm, settings, signals
 from src import news as newsmod
+from src import data as data_mod
 from src.data import get_prices
 
 PAGES: Dict[str, object] = {}  # khoá -> st.Page, do app.py điền
@@ -26,7 +27,8 @@ def get_ctx() -> Ctx:
 
 def current_settings() -> Dict:
     s = st.session_state
-    return {"capital_m": s["capital_m"], "watch": s["watch"], "risk_pct": s["risk_pct"], "max_alloc": s["max_alloc"]}
+    return {"capital_m": s["capital_m"], "watch": s["watch"], "risk_pct": s["risk_pct"], "max_alloc": s["max_alloc"],
+            "auto_price": s.get("auto_price", True), "simple_mode": s.get("simple_mode", False)}
 
 
 def init_state() -> None:
@@ -37,9 +39,11 @@ def init_state() -> None:
     st.session_state["settings_loaded"] = True
 
 
-def page(fn: Callable) -> Callable:
-    """Bọc hàm render(ctx) thành hàm không tham số để st.Page gọi."""
+def page(fn: Callable, key: Optional[str] = None) -> Callable:
+    """Bọc hàm render(ctx) thành hàm không tham số để st.Page gọi. Ghi lại trang đang xem để chatbot hiểu “mã này”, “ở đây”."""
     def _run():
+        if key:
+            st.session_state["current_page"] = key
         fn(get_ctx())
     return _run
 
@@ -48,23 +52,42 @@ def open_page(key: str, state: Optional[Dict] = None) -> None:
     """Chuyển sang trang `key` (và đặt sẵn giá trị). Gọi trong nhánh `if st.button(...)`."""
     for k, v in (state or {}).items():
         st.session_state[k] = v
-    st.switch_page(PAGES[key])
+    if key in PAGES:  # trang nâng cao bị ẩn ở chế độ đơn giản thì không chuyển
+        st.switch_page(PAGES[key])
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load(symbol: str):
+def _ver(symbol: str) -> Tuple[int, int]:
+    """Phiên bản dữ liệu giá của một mã = thời điểm sửa + kích thước file CSV. File đổi (nút Cập nhật, lệnh Terminal, tiến trình khác)
+    thì phiên bản đổi, nên MỌI trang tự đọc lại giá mới thay vì chờ bộ nhớ đệm hết hạn."""
+    try:
+        st_ = (data_mod.CSV_DIR / f"{symbol.upper()}.csv").stat()
+        return (st_.st_mtime_ns, st_.st_size)
+    except OSError:
+        return (0, 0)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _load(symbol: str, ver: Tuple[int, int]):
     return get_prices(symbol)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_long(symbol: str):
-    """Toàn bộ lịch sử có sẵn (backtest và biểu đồ dài hạn cần nhiều năm)."""
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_long(symbol: str, ver: Tuple[int, int]):
     return get_prices(symbol, 1500)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def snapshot(symbols: Tuple[str, ...]):
-    """Tóm tắt từng mã: giá, thay đổi, điểm, cắt lỗ gợi ý, đường giá 60 phiên."""
+def load(symbol: str):
+    """Giá gần đây của một mã: (bảng giá, nguồn). Cùng một phiên bản dữ liệu cho mọi trang."""
+    return _load(symbol, _ver(symbol))
+
+
+def load_long(symbol: str):
+    """Toàn bộ lịch sử có sẵn (backtest và biểu đồ dài hạn cần nhiều năm)."""
+    return _load_long(symbol, _ver(symbol))
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _snapshot(symbols: Tuple[str, ...], vers: Tuple[Tuple[int, int], ...]):
     idx, idx_src = load("VNINDEX")
     out, srcs = [], {idx_src}
     for s in symbols:
@@ -84,6 +107,17 @@ def snapshot(symbols: Tuple[str, ...]):
             "partial": explain.is_partial_session(last_date), "src": src,
         })
     return out, srcs
+
+
+def snapshot(symbols: Tuple[str, ...]):
+    """Tóm tắt từng mã: giá, thay đổi, điểm, cắt lỗ gợi ý, đường giá 60 phiên. Đổi theo phiên bản file giá của chính các mã đó và VN-Index."""
+    symbols = tuple(symbols)
+    return _snapshot(symbols, tuple(_ver(s) for s in ("VNINDEX",) + symbols))
+
+
+def clear_price_caches() -> None:
+    for fn in (_load, _load_long, _snapshot):
+        fn.clear()
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -109,6 +143,12 @@ def strip_items() -> List[Tuple[str, str, Optional[float]]]:
         dec = 2
         items.append((short.get(g["name"], g["name"]), explain.num(g["last"], dec), g["change_pct"] / 100))
     return items
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def news_items():
+    """Tin RSS, giữ 10 phút để các trang dùng chung, không gọi mạng mỗi lần bấm."""
+    return newsmod.fetch_news()
 
 
 def ai_ready() -> bool:

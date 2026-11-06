@@ -106,6 +106,73 @@ h3{margin-top:1.6rem;font-size:1.05rem;} h4{font-size:.95rem;}
 .steps .st{display:flex;gap:12px;align-items:flex-start;padding:7px 0;}
 .steps .n{flex:0 0 22px;height:22px;border-radius:6px;background:$info_bg;color:$info;font-weight:600;font-size:.75rem;display:flex;align-items:center;justify-content:center;}
 .steps .tx{color:$ink;font-size:.88rem;line-height:1.5;padding-top:1px;}
+/* ===== Chatbot nổi ===== */
+.st-key-chatfab{position:fixed;right:24px;bottom:24px;z-index:1000;width:auto;}
+.st-key-chatfab button{border-radius:999px !important;padding:.62rem 1.15rem !important;border:0 !important;color:#fff !important;font-weight:600;letter-spacing:.01em;
+  background:linear-gradient(135deg,#7480EA 0%,$brand 100%) !important;box-shadow:0 10px 28px rgba(94,106,210,.45),0 2px 6px rgba(0,0,0,.4);transition:transform .15s ease,box-shadow .15s ease;}
+.st-key-chatfab button:hover{transform:translateY(-2px);box-shadow:0 14px 34px rgba(94,106,210,.55),0 2px 6px rgba(0,0,0,.4);}
+.st-key-chatfab button p{color:#fff !important;font-size:.9rem;}
+.st-key-chatfab [data-testid="stPopoverButton"] [data-testid="stIconMaterial"]:last-child{display:none;}
+[data-testid="stPopoverBody"]{max-width:min(460px,94vw);max-height:88vh;overflow-y:auto;}
+[data-testid="stPopoverBody"]:has(.chat-root){overflow:hidden !important;max-height:calc(100vh - 100px) !important;}
+/* Chỉ khung tin nhắn được cuộn; chiều cao co theo cửa sổ để cả khung chat luôn vừa màn hình */
+.st-key-chatbox{height:clamp(170px,calc(100vh - 495px),420px) !important;min-height:0 !important;flex:0 0 auto !important;scrollbar-width:thin;}
+[data-testid="stLayoutWrapper"]:has(>.st-key-chatbox){height:auto !important;}
+
+[data-testid="stPopoverBody"]:has(.chat-root){width:min(430px,94vw);background:$card;border:1px solid $line;border-radius:18px;padding:.9rem .9rem .7rem .9rem;
+  box-shadow:0 24px 60px rgba(0,0,0,.65);}
+/* Streamlit cho khối chữ lề dưới −16px để bù lề đoạn văn; ta đặt lại lề đoạn văn nên phải bỏ lề âm này, nếu không bong bóng bị thiếu 16px và cắt mép dưới */
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stMarkdownContainer"]{margin-bottom:0 !important;}
+.chat-root{display:none;}
+.chat-head{display:flex;align-items:center;gap:.65rem;}
+.chat-logo{flex:0 0 auto;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;
+  background:linear-gradient(135deg,#7480EA,$brand);}
+.chat-logo .material-symbols-rounded{font-size:19px;}
+.chat-head .tt{font-weight:600;font-size:.98rem;color:$ink;line-height:1.2;}
+.chat-head .st{font-size:.74rem;color:$soft;display:flex;align-items:center;gap:.4rem;margin-top:2px;}
+.chat-head .dot{width:7px;height:7px;border-radius:50%;background:$muted;display:inline-block;} .chat-head .dot.on{background:$up;box-shadow:0 0 0 3px rgba(61,214,140,.18);}
+.chat-empty{text-align:center;padding:1.2rem .4rem .6rem .4rem;}
+.chat-empty .chat-logo{width:46px;height:46px;margin:0 auto .7rem auto;} .chat-empty .chat-logo .material-symbols-rounded{font-size:25px;}
+.chat-empty .t{font-weight:600;font-size:1.02rem;color:$ink;} .chat-empty .d{color:$soft;font-size:.84rem;margin:.35rem auto .2rem auto;max-width:300px;line-height:1.5;}
+[class*="st-key-chat_sug"] button{justify-content:flex-start;text-align:left;border-radius:12px !important;background:$card2 !important;border:1px solid $line !important;
+  padding:.55rem .8rem !important;font-weight:500;color:$ink !important;transition:border-color .15s ease,background .15s ease;}
+[class*="st-key-chat_sug"] button:hover{border-color:$brand !important;background:$info_bg !important;}
+[class*="st-key-chat_sug"] button p{font-size:.86rem;text-align:left;}
+.st-key-chat_clear button{border:0 !important;background:transparent !important;color:$soft !important;min-height:2rem;}
+.st-key-chat_clear button:hover{color:$down !important;background:$down_bg !important;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessage"]{background:transparent;padding:.35rem 0;gap:.55rem;align-items:flex-start;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessageAvatarCustom"]{width:28px;height:28px;border-radius:50%;flex:0 0 28px;color:#fff;
+  background:linear-gradient(135deg,#7480EA,$brand);}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessage"]:has(.chat-u) [data-testid="stChatMessageAvatarCustom"]{background:#2E333C;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessageContent"]{background:transparent;border:0;padding:0;max-width:calc(100% - 40px);}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessage"]:not(:has(.chat-u)) [data-testid="stChatMessageContent"]>[data-testid="stVerticalBlock"]{background:#1A1D23;border:1px solid #2B3039;border-radius:14px 14px 14px 4px;padding:.6rem .85rem;line-height:1.6;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessageContent"] p,[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessageContent"] li{font-size:.86rem;line-height:1.6;}
+[data-testid="stPopoverBody"] [data-testid="InputInstructions"]{display:none !important;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessageContent"] p{margin-bottom:.45rem;} [data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessageContent"] p:last-child{margin-bottom:0;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessageContent"] ul,[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessageContent"] ol{padding-left:1.1rem;margin:.2rem 0 .45rem 0;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessage"]:has(.chat-u){flex-direction:row-reverse;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stChatMessage"]:has(.chat-u) [data-testid="stChatMessageContent"]{background:transparent;border:0;padding:0;flex:1 1 auto;max-width:none;text-align:right;}
+.chat-u{display:inline-block;max-width:86%;text-align:left;white-space:pre-wrap;word-break:break-word;line-height:1.55;font-size:.86rem;background:rgba(94,106,210,.22);border:1px solid rgba(116,128,234,.5);border-radius:14px 14px 4px 14px;padding:.55rem .8rem;color:$ink;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stForm"]{border:0;padding:0;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-baseweb="input"]{border-radius:999px !important;background:$card2 !important;padding-left:.35rem;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-baseweb="input"]:focus-within{border-color:$brand !important;box-shadow:0 0 0 3px rgba(94,106,210,.22);}
+.st-key-chat_send button{border-radius:50% !important;width:40px;height:40px;min-height:40px;padding:0 !important;background:linear-gradient(135deg,#7480EA,$brand) !important;border:0 !important;color:#fff !important;}
+.st-key-chat_send button:hover{filter:brightness(1.1);}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stHorizontalBlock"]{flex-wrap:nowrap !important;flex-direction:row !important;gap:.5rem;align-items:center;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stColumn"]{min-width:0 !important;}
+[data-testid="stPopoverBody"]:has(.chat-root) [data-testid="stColumn"]:last-child{flex:0 0 auto;width:auto !important;}
+.chat-foot{color:$soft;font-size:.72rem;text-align:center;margin-top:.45rem;line-height:1.4;}
+/* Điện thoại và màn hình hẹp: bớt lề, chữ số gọn hơn, nút to dễ chạm, ô nhập đủ lớn để iPhone không tự phóng to */
+@media (max-width:640px){
+.block-container{padding:3.6rem .75rem 3rem .75rem;}
+.page-title{font-size:1.25rem;} .page-sub{font-size:.84rem;}
+.hero .px{font-size:1.8rem;} .hero .sym{font-size:1.25rem;} .big{font-size:1.5rem;} .stat .value{font-size:1.2rem;}
+.card{padding:12px;} .sec{flex-wrap:wrap;gap:2px;} .kv{font-size:.84rem;gap:10px;}
+.stButton>button,.stFormSubmitButton>button,.stDownloadButton>button{min-height:2.7rem;}
+input,textarea,[data-baseweb="select"] *{font-size:16px !important;}
+[data-testid="stDataFrame"],.stMarkdown table{overflow-x:auto;} .stMarkdown table{display:block;}
+[data-testid="stHorizontalBlock"]{gap:.5rem;}
+}
 </style>
 """)
 

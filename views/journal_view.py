@@ -7,7 +7,7 @@ import re
 import pandas as pd
 import streamlit as st
 
-from src import explain, journal, ui
+from src import explain, journal, journal_stats, ui
 from views import shared
 
 
@@ -18,6 +18,65 @@ def _reason_text(r) -> str:
 
 def _clean_reason(r) -> str:
     return re.sub(r"\[sao kê [0-9a-f]{10}\]\s*", "", str(r or ""))
+
+
+def _tag_picker(current, key: str):
+    """Chọn thẻ có sẵn hoặc gõ thẻ mới. Thẻ giúp thống kê lỗi lặp lại; “Không đặt cắt lỗ” và “Chưa ghi lý do mua” được tự nhận."""
+    cur = journal.split_tags(current if isinstance(current, str) else "")
+    options = journal_stats.ALL_TAGS + [x for x in cur if x not in journal_stats.ALL_TAGS]
+    return st.multiselect("Thẻ cho lệnh này (lỗi hoặc điểm tốt, không bắt buộc)", options, default=cur, key=key, accept_new_options=True,
+                          help="Gắn thẻ để app thống kê bạn hay thắng hoặc thua vì lý do gì. Có thể gõ thẻ mới. "
+                               "Thẻ “Không đặt cắt lỗ” và “Chưa ghi lý do mua” được app tự nhận, không cần gắn.")
+
+
+def _stats_table(df: pd.DataFrame, label_col: str, label: str) -> None:
+    show = pd.DataFrame({label: df[label_col], "Số lệnh": df["n"], "Tỷ lệ thắng": df["win_rate"].map(lambda x: explain.pct(x, 0, signed=False)),
+                         "Lãi/lỗ TB mỗi lệnh": df["avg_ret"].map(lambda x: explain.pct(x, 1)),
+                         "Tổng lãi/lỗ": df["total_pnl"].map(lambda x: explain.vnd(x)),
+                         "Lưu ý": df["small"].map(lambda s: "mẫu nhỏ, chỉ tham khảo" if s else "")})
+    tk = ui.tokens()
+    sty = show.style.apply(lambda col: [f"color:{tk['down'] if str(v).startswith('-') else tk['up']};font-weight:600" for v in col],
+                           subset=["Lãi/lỗ TB mỗi lệnh"])
+    st.dataframe(sty, hide_index=True, width="stretch")
+
+
+def _analysis(trades: pd.DataFrame) -> None:
+    ui.section("Phân tích nhật ký", "Bạn thắng hoặc thua nhiều nhất ở đâu?")
+    d = journal_stats.enrich(trades)
+    if d.empty:
+        ui.callout("Cần ít nhất một lệnh đã bán (có giá bán) để phân tích. Hãy gắn thẻ cho từng lệnh để thống kê chính xác hơn.", "info")
+        return
+    s = journal_stats.summary(d)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        ui.stat_card("Lệnh đã bán", f"{s['n']} lệnh", "Cần khoảng 20 lệnh để đáng tin" if not s["reliable"] else "Đủ để tham khảo")
+    with c2:
+        ui.stat_card("Tỷ lệ thắng", explain.pct(s["win_rate"], 0, signed=False))
+    with c3:
+        ui.stat_card("Lãi/lỗ TB mỗi lệnh", explain.pct(s["avg_ret"], 1), "sau phí và thuế bán ước tính", ui.change_kind(s["avg_ret"]))
+    with c4:
+        ui.stat_card("Giữ trung bình", f"{s['avg_days']:.0f} ngày" if s["avg_days"] == s["avg_days"] else "Chưa rõ",
+                     (f"lãi TB gấp {s['payoff']:.1f} lần lỗ TB" if s["payoff"] == s["payoff"] else ""))
+    ins = journal_stats.insights(d)
+    if ins:
+        ui.callout("\n".join("• " + x for x in ins), "info" if s["reliable"] else "warn", "Nhận xét từ số liệu của bạn")
+    t1, t2, t3 = st.tabs(["Theo thẻ", "Theo thời gian giữ", "Có và không cắt lỗ"])
+    with t1:
+        bt = journal_stats.by_tag(d)
+        if bt.empty:
+            st.info("Chưa có thẻ nào.")
+        else:
+            bt = bt.assign(tag=bt.apply(lambda r: r["tag"] + (" (điểm tốt)" if r["good"] else ""), axis=1))
+            _stats_table(bt, "tag", "Thẻ")
+    with t2:
+        bh = journal_stats.by_holding(d)
+        if bh.empty:
+            st.info("Chưa có lệnh nào có đủ ngày mua và ngày bán để tính thời gian giữ.")
+        else:
+            _stats_table(bh, "bucket", "Thời gian giữ")
+    with t3:
+        _stats_table(journal_stats.by_stop(d), "group", "Nhóm")
+    st.caption("Các con số chỉ mô tả lệnh của bạn, không chứng minh nguyên nhân. Nhóm dưới 5 lệnh được đánh dấu “mẫu nhỏ”; nhận xét chỉ xuất hiện khi mỗi nhóm có ít nhất 3 lệnh.")
 
 
 def _nz(x, default=0.0) -> float:
@@ -36,6 +95,7 @@ def _quick_form(t) -> None:
     with st.form(f"jq_{tid}"):
         reason = st.text_area("Vì sao bạn mua?", value="" if placeholder else clean, key=f"jq_reason_{tid}",
                               placeholder="Ví dụ: Xu hướng tăng, doanh nghiệp công bố lợi nhuận tốt...")
+        tags = _tag_picker(t.get("tags") if hasattr(t, "get") else None, f"jq_tags_{tid}")
         a, b = st.columns(2)
         stop = a.number_input("Giá cắt lỗ (đồng, 0 = chưa đặt)", min_value=0.0, value=_nz(t["stop"]), step=50.0, format="%.0f",
                               key=f"jq_stop_{tid}", help="Mức giá bạn tự bán để không lỗ sâu hơn. Thường thấp hơn giá mua; nếu giá đã tăng, có thể kéo lên trên giá mua để giữ lại phần lãi.")
@@ -43,7 +103,7 @@ def _quick_form(t) -> None:
                                 key=f"jq_target_{tid}", help="Mức giá bạn hy vọng chốt lãi. Phải cao hơn giá mua.")
         if st.form_submit_button("Lưu", type="primary"):
             try:
-                journal.update_trade(tid, reason=reason, stop=stop, target=target)
+                journal.update_trade(tid, reason=reason, stop=stop, target=target, tags=tags)
             except ValueError as e:
                 st.error(str(e))
             else:
@@ -74,6 +134,7 @@ def _full_editor(trades: pd.DataFrame) -> None:
         opened = c6.text_input("Ngày mua (YYYY-MM-DD hoặc “Không rõ”)", value=t["opened"], key=f"je_opened_{tid}")
         clean = _clean_reason(t["reason"])
         reason = st.text_area("Vì sao bạn mua?", value="" if clean.startswith(journal.PLACEHOLDER_REASON) else clean, key=f"je_reason_{tid}")
+        tags = _tag_picker(t.get("tags"), f"je_tags_{tid}")
         extra = {}
         if closed:
             c7, c8, c9 = st.columns(3)
@@ -82,7 +143,7 @@ def _full_editor(trades: pd.DataFrame) -> None:
             extra["note"] = c9.text_input("Bài học rút ra", value=t["note"] or "", key=f"je_note_{tid}")
         if st.form_submit_button("Lưu thay đổi", type="primary"):
             try:
-                journal.update_trade(tid, symbol=symbol, qty=qty, entry=entry, stop=stop, target=target, opened=opened, reason=reason, **extra)
+                journal.update_trade(tid, symbol=symbol, qty=qty, entry=entry, stop=stop, target=target, opened=opened, reason=reason, tags=tags, **extra)
             except ValueError as e:
                 st.error(str(e))
             else:
@@ -209,4 +270,5 @@ def render(ctx) -> None:
                     subset=["Lãi/lỗ (đồng)", "Lãi/lỗ (%)"]))
         st.dataframe(sty, hide_index=True, width="stretch")
 
+    _analysis(trades)
     _full_editor(trades)

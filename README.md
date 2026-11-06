@@ -49,6 +49,8 @@ biểu đồ vùng, bảng theo dõi có biểu đồ nhỏ (bấm dòng để m
 | 🔎 Tra cứu cổ phiếu | Giá lớn + huy hiệu %, vùng giá 1 năm, số liệu nhanh, "Đánh giá nhanh", câu "Nói đơn giản", AI phân tích + phản biện |
 | 🧮 Tính lệnh mua | Nhập 3 mức giá -> nên mua bao nhiêu cổ phiếu, nếu sai mất bao nhiêu, nếu đúng lãi bao nhiêu (lô 100, phí, thuế, T+2) |
 | Danh mục | Cổ phiếu đang giữ, tổng tài sản, lãi/lỗ, tỷ trọng, cảnh báo tập trung. Nhập tay / file CSV-Excel (danh mục đang giữ HOẶC lịch sử giao dịch, tự nhận loại) / từ Nhật ký / TCBS **chỉ đọc** |
+| Mua dần | Lập kế hoạch bỏ cố định mỗi tháng: chia cho các mã hoặc luân phiên, lô 100, phí 0,15%, tiền dư dồn sang tháng sau (giả định giá giữ nguyên, không dự báo lãi) |
+| Báo cáo tháng | Chọn tháng, tải **Excel** hoặc **PDF** (tài sản, lệnh đã bán, tiền nạp/rút, cổ tức, nhận xét từ Nhật ký) |
 | 📓 Nhật ký giao dịch | Ghi lệnh kèm lý do bắt buộc, theo dõi lệnh đang giữ (cảnh báo gần cắt lỗ), thống kê lệnh đã bán |
 | 🔬 Nghiên cứu (nâng cao) | Kết luận bằng lời, kiểm chứng điểm xu hướng, kiểm tra gắt hơn (train/test), động lượng + sổ giả lập |
 | ❓ Hướng dẫn | Cách dùng, nguyên tắc cho người mới, cập nhật dữ liệu, bật AI, từ điển |
@@ -65,7 +67,7 @@ Lưu ý: nếu phiên hôm nay chưa đóng cửa (trước 15:05), app báo gi�
   `src/news.py` RSS + thế giới, `src/llm.py` lớp AI (JSON), `src/backtest.py` backtest + train/test,
   `src/xsection.py` xếp hạng giữa các mã + phép thử hoán vị, `src/paper.py` sổ giả lập, `src/journal.py` nhật ký.
 - `scripts/download_prices.py`, `scripts/run_signals.py` (báo cáo 5 tín hiệu xếp hạng).
-- `tests/` 73 kiểm thử: `python -m pytest -q`.
+- `tests/` 74 kiểm thử: `python -m pytest -q`.
 
 ## Kết quả nghiên cứu (VN30, 2018-11 → 2026-11): đọc trước khi tin bất kỳ tín hiệu nào
 Mọi kết quả: mua ở giá mở cửa phiên sau tín hiệu, trừ phí/thuế, so với đường cơ sở, có kiểm tra train/test.
@@ -123,3 +125,71 @@ là “chưa có cắt lỗ”. “Mất nếu chạm” = số lượng đượ
 `src/updater.py` + `views/data_update.py`: nút “Cập nhật giá” ở Tổng quan (gọn), Cài đặt (đầy đủ, tuỳ chọn cả VN30) và màn hình chưa có dữ liệu. Cập nhật TĂNG DẦN (lấy từ 7 ngày trước ngày cuối của file, gộp theo ngày, bản mới thắng),
 không bao giờ làm file ngắn đi, giữ nguyên file khi lỗi mạng/khoá, phát hiện giá lịch sử bị điều chỉnh (chia tách/cổ tức) thì tải lại toàn bộ (nhưng GIỮ file cũ nếu nguồn chỉ trả ít phiên hơn, ví dụ gói Khách 365 ngày), ghi nguyên tử.
 Cần vnstock đã đăng ký. Dữ liệu KHÔNG realtime: chỉ đổi khi bấm nút; nến hôm nay là ảnh chụp tại lúc cập nhật, nên cập nhật sau 15:05. Đổi thư mục giá khi thử bằng `PRICES_DIR`.
+
+## Đồng bộ giá giữa các trang
+Mọi trang (Tổng quan, Tra cứu, Danh mục, Nhật ký, Rủi ro, lãi thật) đọc giá qua `views/shared.py`. Bộ nhớ đệm được gắn với PHIÊN BẢN FILE GIÁ (thời điểm sửa + kích thước file CSV của đúng các mã liên quan),
+nên giá đổi bằng nút Cập nhật, lệnh Terminal hay tiến trình khác đều làm mọi trang đổi theo ngay, không chờ hết hạn (trước đây các trang giữ giá cũ tới 30–60 phút và có thể lệch nhau).
+Bộ nhớ đệm cho mã chưa có file CSV (lấy trực tiếp) chỉ giữ 15 phút. Có test tái hiện lỗi cũ và kiểm tra Danh mục/Nhật ký/Tra cứu cùng hiện một giá.
+
+## Phân tích Nhật ký (thẻ lỗi)
+Mỗi lệnh có thể gắn tối đa 8 thẻ (ví dụ “Mua vì tin đồn”, “Mua đuổi giá (FOMO)”, “Đúng kế hoạch”). Lệnh chưa đặt cắt lỗ hoặc chưa ghi lý do được tự nhận thẻ. Trang Nhật ký thống kê tỷ lệ thắng và lãi trung bình theo thẻ, theo thời gian giữ, có/không cắt lỗ. Nhận xét tự động chỉ xuất hiện khi mỗi nhóm có từ 3 lệnh, và luôn cảnh báo khi dưới 20 lệnh đã bán. Bảng cũ được nâng cấp bằng `ALTER TABLE` nên không mất lệnh nào.
+
+## Cổ tức
+Trang Danh mục, mục “Cổ tức”: ghi cổ tức tiền mặt hoặc cổ phiếu thưởng (`data/dividends.db`). Tuỳ chọn “Cập nhật Danh mục luôn”: tiền mặt được cộng vào tiền mặt Danh mục (nên đã nằm trong lãi thật); cổ phiếu thưởng tăng số lượng và giảm giá vốn bình quân (tổng giá vốn giữ nguyên). Kiểm tra làm trước khi ghi nên không bao giờ ghi nửa chừng. Xoá ghi chép KHÔNG hoàn lại thay đổi đã áp dụng vào Danh mục.
+
+## Mua dần và Báo cáo tháng
+`src/dca.py` lập bảng mua dần (lô 100, phí 0,15%, tiền dư dồn sang sau, cảnh báo mã mà một lô lớn hơn phần tiền được chia). `src/report.py` gom số liệu một tháng và xuất Excel (openpyxl) hoặc PDF (fpdf2, cần phông Arial/DejaVu có tiếng Việt; không có thì nút PDF bị tắt, Excel vẫn dùng được). Cài thêm: `pip install fpdf2`.
+
+## Sao lưu, cảnh báo, so sánh VN-Index
+- **Sao lưu** (Cài đặt): tải file .zip hoặc lưu vào `data/backups` (giữ 20 bản). Khôi phục chỉ nhận đúng các file của app, kiểm tra CSDL không hỏng, và tự lưu bản dữ liệu hiện tại trước khi ghi đè. Không gồm file giá.
+- **Cảnh báo** (đầu mọi trang): lệnh đang giữ trong Nhật ký chạm hoặc gần (trong 3%) mức cắt lỗ/mục tiêu. Trên Mac có thêm thông báo hệ thống cho cảnh báo chạm mức (mỗi cảnh báo một lần mỗi ngày). Mức cắt lỗ chưa đặt (0) không cảnh báo.
+- **So với VN-Index** (Danh mục): mô phỏng bỏ cùng các khoản nạp/rút vào chỉ số đúng ngày, rồi so với tài sản hiện tại. Bỏ qua phí và cổ tức của chỉ số.
+
+## Tin tức về mã đang giữ
+Trang Danh mục có mục tin tức: chỉ lấy tin nhắc ĐÍCH DANH mã (viết hoa, đứng riêng) trong tiêu đề/mô tả từ CafeF, VnExpress, Vietstock; luôn hiện nguồn và liên kết gốc. Nếu đã bật AI, nút “Tóm tắt bằng AI” chỉ gửi mã và tiêu đề/mô tả tin công khai (không gửi số lượng, giá vốn, vốn). Kết quả AI được kiểm tra: chỉ nhận mã đã hỏi, tác động chỉ 4 loại, số thứ tự tin phải hợp lệ; nguồn và liên kết lấy từ tin gốc của code, không từ AI.
+
+## Dành cho người mới
+- **Hôm nay bạn cần làm gì** (Tổng quan, `src/todo.py`): tối đa 3 việc xếp theo mức khẩn (chạm cắt lỗ, thiếu cắt lỗ, tỷ trọng quá cao, tiền mặt dự phòng, chưa cập nhật giá, chưa ghi lý do), mỗi việc có nút đi tới đúng trang. Không có việc thì ghi rõ là không cần làm gì.
+- **Kiểm tra trước khi mua** (Tính lệnh mua, `src/precheck.py`): đèn xanh/vàng/đỏ cho số cổ phiếu bạn định mua: cắt lỗ, mức mất nếu sai, dồn vào một mã, tiền mặt dự phòng, lãi so với lỗ, thanh khoản. Không khuyên mua hay không mua; ngưỡng nào cũng được nêu trong câu giải thích. Tỷ lệ % tính theo vốn ở Cài đặt, tiền mặt lấy từ Danh mục.
+- **Từ điển** (nút trên cùng mọi trang và trang Hướng dẫn, `src/glossary.py`): 16 thuật ngữ, ví dụ bằng số thật của bạn (vốn, mức chấp nhận mất, giá/cắt lỗ ở Tính lệnh mua).
+
+## Hỏi trợ lý, bộ lọc, chế độ đơn giản, điện thoại
+- **Hỏi trợ lý** (trang `hoi-dap`, `src/ask.py`): “giờ mua có ổn không, hay đợi giá xuống?”. Trả lời bằng số, không đoán giá: giá đang ở đâu so với đỉnh 1 năm và đường trung bình, so với giá vốn của bạn, giá vốn trung bình mới nếu mua một lần hoặc chia 2 đến 4 lần (kịch bản giá đi ngang, giảm, tăng), tỷ trọng sau khi mua. Ở đầu trang có ô **Hỏi AI** (nếu đã bật AI): AI nói thẳng quan điểm (mua ngay, mua chia lần, đợi, tránh) kèm mức tự tin, lý do từ số liệu, điều sẽ làm nó đổi ý và rủi ro; tin hay không là quyền của bạn. Câu trả lời được kiểm tra định dạng, AI không được bịa số liệu hay hứa lợi nhuận. Mặc định chỉ gửi số liệu thị trường và tỷ lệ; công tắc “Cho AI biết danh mục và số tiền của tôi” mới gửi thêm số tiền, số lượng, giá vốn, tiền mặt và vốn.
+- **Bộ lọc cổ phiếu** (Tra cứu cổ phiếu, `src/screener.py`): thanh khoản, xu hướng, biến động, RSI, cách đỉnh 1 năm. Chỉ để thu hẹp danh sách cần xem, không phải khuyến nghị mua.
+- **Chế độ đơn giản** (Cài đặt): ẩn Mua dần, Báo cáo tháng, Nghiên cứu.
+- **Điện thoại**: giao diện co theo màn hình hẹp (menu mở bằng nút `>>`). Để mở trên điện thoại cùng WiFi: chạy `streamlit run app.py --server.address 0.0.0.0`, rồi vào `http://<địa chỉ IP máy tính>:8501`. Dữ liệu cá nhân của bạn sẽ hiện cho mọi thiết bị trong mạng đó, nên hãy đặt `APP_PIN=` (ít nhất 4 ký tự) trong file `.env` để app hỏi mã trước; sai 5 lần thì khoá 60 giây. Đây chỉ là lớp chắn cho WiFi nhà, KHÔNG dùng để đưa app ra Internet. Mỗi lần tải lại trang sẽ hỏi lại mã.
+- Tự cập nhật giá chạy ở luồng nền, nên trang không bị chặn khi app mới khởi động.
+
+## Chatbot AI nổi (mọi trang)
+Nút **Hỏi AI** ở góc dưới bên phải mọi trang mở khung chat nhiều lượt (`views/chatbot.py`). AI đọc toàn bộ dữ liệu bạn đã nhập (danh mục và giá vốn, nhật ký kèm lý do và thẻ, tiền nạp/rút, cổ tức, so với VN-Index, rủi ro, cảnh báo, cài đặt) cùng giá hiện tại và tin tức nhắc mã bạn giữ (`src/chat_context.py`, giới hạn 30.000 ký tự, bỏ lệnh cũ nhất trước). Công tắc **Cho AI đọc dữ liệu của tôi** (mặc định bật): tắt thì chỉ gửi giá thị trường. Khoá API, mã PIN và thông tin đăng nhập broker không bao giờ được gửi. AI chỉ trả lời, không đặt lệnh hay sửa dữ liệu; nội dung trong dữ liệu (lý do ghi chú, tiêu đề tin) bị coi là dữ liệu, không phải chỉ thị. Dữ liệu được gửi tới nhà cung cấp AI bạn cấu hình (Gemini/Claude...).
+
+## Hiệu năng
+Đo thực tế: mỗi trang dựng xong trong dưới 1 giây (lần đầu), lần gọi mạng lớn nhất (tin RSS, chỉ số thế giới) khoảng 1 đến 1,5 giây và được cache. Đã làm: (1) tự cập nhật giá chạy ở luồng nền nên không chặn trang; (2) chatbot và ô Hỏi AI ở trang Hỏi trợ lý trả lời dạng stream và gõ chữ dần từng từ như ChatGPT (`llm.smooth`: Gemini gửi cả câu trong khoảng 1 giây theo từng cục 60 đến 110 ký tự nên cần làm mượt nhịp hiện; nội dung không đổi); chữ đầu hiện sau khoảng 3 đến 5 giây, phần lớn là thời gian suy nghĩ của mô hình; (3) file Excel, PDF và bản sao lưu chỉ được tạo khi bấm tải, không tạo lại sau mỗi thao tác trên trang.
+
+## Tỷ lệ tính trên vốn của bạn (chỉ đầu tư một phần)
+Danh mục chỉ ghi cổ phiếu và tiền mặt bạn nhập. Nếu vốn đặt ở Cài đặt lớn hơn số đã ghi (bạn chỉ đầu tư một phần), mọi tỷ lệ % (tỷ trọng một mã, tiền mặt dự phòng, mất nếu chạm cắt lỗ, cảnh báo, chatbot) tính trên **vốn đó**, phần chưa ghi coi là tiền chưa đầu tư (`portfolio.valuate(..., capital)`, `risk_table.build(..., capital)`). Vốn nhỏ hơn số đã ghi thì dùng số đã ghi. Riêng **lãi thật** vẫn dùng số đã ghi trong Danh mục, nên muốn lãi thật chính xác hãy ghi tiền mặt thực tế ở tab “Nhập tay”.
+
+## Chatbot không làm đứng trang và không mất tin nhắn
+- Khung chat và ô Hỏi AI (trang Hỏi trợ lý) là `st.fragment`: gửi câu hỏi và stream câu trả lời chỉ chạy lại khung đó, phần trang phía sau không bị mờ hay đứng.
+- Câu hỏi được lưu NGAY khi gửi; câu trả lời được lưu dần theo từng đoạn (`chatbot._tee`). Nếu bị ngắt giữa chừng, phần đã có vẫn còn và được ghi chú "bị ngắt giữa chừng"; tin dở dang không được gửi lại cho AI làm ngữ cảnh.
+- Trong lúc AI đang trả lời (tối đa 120 giây), tự cập nhật giá không làm mới cả trang (việc đó từng cắt ngang câu trả lời); sau khi xong sẽ làm mới ở lần kiểm tra kế tiếp. Biến môi trường `AUTO_TICK` (mặc định `1m`) đổi chu kỳ kiểm tra, dùng để thử nghiệm.
+
+## Giao diện chatbot
+Nút **Hỏi AI** nổi (gradient chàm, bóng đổ) mở khung chat: tiêu đề có logo và trạng thái (chấm xanh khi đang đọc dữ liệu của bạn), nút xoá cuộc trò chuyện, mục “Quyền riêng tư” thu gọn (công tắc cho AI đọc dữ liệu), màn hình chào kèm 3 câu gợi ý dạng thẻ biến mất khi bạn gửi câu hỏi đầu tiên, bong bóng tin nhắn (của bạn căn phải, của AI căn trái, avatar tròn), ô nhập bo tròn với nút gửi tròn, dòng nhắc AI có thể sai. Hàng tiêu đề và hàng nhập luôn nằm ngang kể cả trên điện thoại. CSS nằm ở `src/ui.py` (khối “Chatbot nổi”); sau khi sửa CSS cần khởi động lại `streamlit run` để nạp bản mới.
+Lưu ý kỹ thuật khi chỉnh CSS chatbot: (1) khung ngoài không cuộn, chỉ khung tin nhắn (`st.container(key="chatbox")`) cuộn, chiều cao co theo cửa sổ (`clamp(170px, 100vh - 495px, 420px)`); (2) Streamlit cho khối chữ lề dưới -16px để bù lề đoạn văn, nên khi đặt lại lề đoạn văn phải bỏ lề âm này, nếu không bong bóng bị cắt mép dưới; (3) bong bóng của bạn là phần tử `.chat-u` tự vẽ (nội dung được escape), không dựa vào khung nội bộ của Streamlit.
+
+## Lịch sử chat, số liệu AI, sao lưu tự động
+- **Lịch sử chat** lưu ở `data/chat_history.json` (`src/chat_store.py`, tối đa 60 tin nhắn, ghi nguyên tử, file hỏng thì bỏ qua), nên tải lại trang hay đóng tab vẫn còn; nút xoá cũng xoá file. File này nằm trong bản sao lưu và trong `.gitignore`.
+- **Số liệu cho AI** (`chat_context.so_lieu_da_tinh_san`): code tính sẵn và gắn nhãn rõ nghĩa (lãi/lỗ của phần cổ phiếu so với giá vốn khác lãi/lỗ so với TỔNG tài sản; mã chưa có lệnh trong nhật ký khác mã có lệnh nhưng chưa đặt cắt lỗ). AI được dặn trích đúng nhãn, không tự tính lại.
+- **Sao lưu tự động**: mỗi ngày mở app là có tối đa một bản `sao-luu-...-tu-dong.zip` trong `data/backups` (giữ 14 bản, tính riêng với bản thủ công giữ 20); chỉ tạo khi đã có dữ liệu; lỗi thì bỏ qua. Biến môi trường `BACKUP_DIR`, `CHAT_PATH` đổi nơi lưu (dùng khi thử nghiệm).
+
+## Chatbot hiểu trang đang xem, sức khoẻ dữ liệu, ghi lệnh bằng chat
+- **Hiểu trang đang xem** (`chat_context.describe_page`): chatbot biết bạn đang ở trang nào, đang xem mã nào (Tra cứu, Tính lệnh mua, Hỏi trợ lý) và đang nhập số gì, nên “mã này”, “ở đây”, “số này” được hiểu đúng; câu gợi ý cũng đổi theo trang. Khung chat được vẽ SAU phần trang để biết trang hiện tại.
+- **Sức khoẻ dữ liệu** (`src/health.py`, mục thu gọn ở Tổng quan; cũng đưa cho chatbot): giá thiếu hoặc cũ từ 2 đến 3 phiên, Danh mục cũ hơn 7 ngày, chưa ghi tiền mặt dù đã ghi tiền nạp/rút, Danh mục và Nhật ký lệch số lượng hoặc lệch mã, vốn ở Cài đặt nhỏ hơn Danh mục, chưa có bản sao lưu gần đây. Mỗi mục có nút đi tới trang cần sửa.
+- **Ghi lệnh bằng chat** (`src/trade_parse.py`): gõ “hôm nay mua 100 FPT giá 120k, cắt lỗ 112k, mục tiêu 140k vì báo cáo tốt” hoặc “bán 100 FPT giá 130k hôm qua” thì chatbot soạn BẢN NHÁP (không gọi AI; bộ đọc câu theo quy tắc cố định, vì AI có thể hiểu sai số). Bạn sửa các ô rồi bấm “Ghi vào Nhật ký”; chưa duyệt thì chưa ghi gì. Câu hỏi (“có nên mua 100 FPT không?”) không bao giờ bị coi là lệnh. Giá ghi tắt “k” = nghìn; số nhỏ hơn 1.000 không đơn vị được hiểu là nghìn đồng và có ghi chú. Bán chỉ đóng được lệnh đang mở khớp đúng mã và số lượng (bán một phần chưa hỗ trợ). Chỉ ghi vào Nhật ký, Danh mục không tự đổi.
+
+## Tự nhập sao kê (không cần API)
+- **Thư mục sao kê** (`src/inbox.py`, mặc định `data/inbox`, đổi bằng `INBOX_DIR`): tải sao kê Excel/CSV (danh mục đang giữ hoặc lịch sử lệnh khớp) từ công ty chứng khoán rồi lưu vào thư mục này; app (đang mở hoặc lần mở sau) tự đọc, cập nhật Danh mục (giữ nguyên tiền mặt đã ghi) và Nhật ký (không trùng lệnh). Trước mỗi lần nhập có một bản sao lưu đầy đủ (`...-truoc-nhap.zip`); Cài đặt, mục “Tự nhập sao kê” có nút **Hoàn tác lần nhập gần nhất** (chỉ khôi phục Nhật ký và Danh mục). File xử lý xong được chuyển sang `da-xu-ly`, không xoá; mỗi file chỉ xử lý một lần theo nội dung.
+- Không nhận ra mã cổ phiếu trong file thì app KHÔNG ghi gì và báo lý do; khi đó tải file lên ở trang Danh mục và tự chọn cột.
+- **Dán bảng từ web**: ở trang Danh mục, tab Nhập từ file, mở mục “Hoặc dán bảng copy từ trang web”.
+- Chưa kiểm tra với file sao kê thật của TCBS (chưa có file mẫu): tên cột được nhận theo cách đoán chung (Mã, Khối lượng, Giá vốn; Mua/Bán, Khối lượng, Giá).
