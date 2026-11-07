@@ -11,3 +11,6 @@ pytest
 watchdog
 openpyxl
 fpdf2
+fastapi
+uvicorn
+httpx

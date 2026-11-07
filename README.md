@@ -193,3 +193,18 @@ Lưu ý kỹ thuật khi chỉnh CSS chatbot: (1) khung ngoài không cuộn, ch
 - Không nhận ra mã cổ phiếu trong file thì app KHÔNG ghi gì và báo lý do; khi đó tải file lên ở trang Danh mục và tự chọn cột.
 - **Dán bảng từ web**: ở trang Danh mục, tab Nhập từ file, mở mục “Hoặc dán bảng copy từ trang web”.
 - Chưa kiểm tra với file sao kê thật của TCBS (chưa có file mẫu): tên cột được nhận theo cách đoán chung (Mã, Khối lượng, Giá vốn; Mua/Bán, Khối lượng, Giá).
+
+## Market API (cho app finwise)
+Bọc lõi `src/` thành HTTP API để backend Node gọi. Streamlit vẫn chạy song song, không bị ảnh hưởng.
+```bash
+MARKET_API_KEY=<chuoi-bi-mat> .venv/bin/uvicorn api.main:app --port 8001
+```
+| Endpoint | Việc làm |
+|---|---|
+| `GET /v1/health` | Kiểm tra sống (không cần key) |
+| `GET /v1/quotes/{mã}?days=250` | Giá đóng cửa, % thay đổi, vùng 52 tuần, chuỗi giá |
+| `GET /v1/signals/{mã}` | Điểm lọc 0-100, lý do, cảnh báo, gợi ý cắt lỗ theo ATR |
+| `POST /v1/risk/position-size` | Số cổ phiếu nên mua theo vốn, giá vào, giá cắt lỗ |
+
+Có `MARKET_API_KEY` thì các endpoint trừ health cần header `X-Api-Key`. Kết quả luôn kèm cờ `demo`
+khi giá là dữ liệu giả lập. Test: `python -m pytest tests/test_api.py -q`.
