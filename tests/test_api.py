@@ -144,14 +144,14 @@ def test_brief_failure_is_a_502_not_a_leak(client, monkeypatch):
 def test_assistant_answers_from_the_context_and_hides_failures(client, monkeypatch):
     monkeypatch.setattr(main.llm, "has_key", lambda: True)
     seen = []
-    monkeypatch.setattr(main.llm, "assistant_answer", lambda q, c: seen.append((q, c)) or "Bạn tiêu nhiều nhất vào ăn uống.")
+    monkeypatch.setattr(main.llm, "assistant_answer", lambda q, c, h=None: seen.append((q, c)) or "Bạn tiêu nhiều nhất vào ăn uống.")
     ok = client.post("/v1/assistant", json={"question": " Tháng này tiêu gì nhiều? ", "context": "Ăn uống: 3.000.000"})
     assert ok.status_code == 200
     assert ok.json()["answer"].startswith("Bạn tiêu")
     assert "không phải lời khuyên" in ok.json()["disclaimer"]
     assert seen == [("Tháng này tiêu gì nhiều?", "Ăn uống: 3.000.000")]
 
-    monkeypatch.setattr(main.llm, "assistant_answer", lambda q, c: (_ for _ in ()).throw(RuntimeError("secret key abc")))
+    monkeypatch.setattr(main.llm, "assistant_answer", lambda q, c, h=None: (_ for _ in ()).throw(RuntimeError("secret key abc")))
     bad = client.post("/v1/assistant", json={"question": "x", "context": "y"})
     assert bad.status_code == 502 and "secret" not in bad.text
 
@@ -161,3 +161,22 @@ def test_assistant_validates_and_needs_an_llm(client, monkeypatch):
     assert client.post("/v1/assistant", json={"question": "x", "context": "y" * 6001}).status_code == 422
     monkeypatch.setattr(main.llm, "has_key", lambda: False)
     assert client.post("/v1/assistant", json={"question": "x", "context": "y"}).status_code == 503
+
+
+def test_assistant_passes_recent_turns_and_caps_them(client, monkeypatch):
+    monkeypatch.setattr(main.llm, "has_key", lambda: True)
+    seen = []
+    monkeypatch.setattr(main.llm, "assistant_answer", lambda q, c, h=None: seen.append(h) or "ok")
+    turn = {"question": "Tháng này?", "answer": "Ăn uống nhiều nhất."}
+    assert client.post("/v1/assistant", json={"question": "Còn tháng trước?", "context": "x", "history": [turn]}).status_code == 200
+    assert seen == [[("Tháng này?", "Ăn uống nhiều nhất.")]]
+    assert client.post("/v1/assistant", json={"question": "x", "context": "y", "history": [turn] * 5}).status_code == 422
+
+
+def test_assistant_prompt_includes_earlier_turns(monkeypatch):
+    from src import llm
+    prompts = []
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compat")
+    monkeypatch.setattr(llm, "_complete", lambda prompt, n, system=None: prompts.append(prompt) or "ok")
+    llm.assistant_answer("Còn tháng trước?", "Ăn uống: 1", [("Tháng này?", "Ăn uống.")])
+    assert "Hỏi: Tháng này?" in prompts[0] and "Đáp: Ăn uống." in prompts[0] and prompts[0].endswith("Còn tháng trước?")

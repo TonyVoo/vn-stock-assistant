@@ -239,9 +239,15 @@ def morning_brief(symbols: str = Query(...)) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail="brief failed")
 
 
+class AssistantTurn(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    answer: str = Field(min_length=1, max_length=800)
+
+
 class AssistantIn(BaseModel):
     question: str = Field(min_length=1, max_length=500)
     context: str = Field(min_length=1, max_length=6000)
+    history: List[AssistantTurn] = Field(default_factory=list, max_length=4)
 
 
 @app.post("/v1/assistant", dependencies=[Depends(require_key)])
@@ -250,7 +256,8 @@ def assistant(body: AssistantIn) -> Dict[str, Any]:
     if not llm.has_key():
         raise HTTPException(status_code=503, detail="no llm configured")
     try:
-        answer = llm.assistant_answer(body.question.strip(), body.context)
+        answer = llm.assistant_answer(body.question.strip(), body.context,
+                                      [(t.question, t.answer) for t in body.history])
     except Exception:
         raise HTTPException(status_code=502, detail="assistant failed")
     if not answer:
