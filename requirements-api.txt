@@ -1,0 +1,13 @@
+# Only what the market service (api/main.py) imports: the Streamlit app's extras are left out of the image.
+pandas
+numpy
+anthropic
+feedparser
+yfinance
+requests
+python-dotenv
+fastapi
+uvicorn
+httpx
+# vnstock (the Vietnamese price source) is installed apart from PyPI and needs a free key: see README, "Dữ liệu giá".
+# Without it the service falls back to VNDirect; see src/data.py.

@@ -237,3 +237,22 @@ def morning_brief(symbols: str = Query(...)) -> Dict[str, Any]:
         raise
     except Exception:
         raise HTTPException(status_code=502, detail="brief failed")
+
+
+class AssistantIn(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    context: str = Field(min_length=1, max_length=6000)
+
+
+@app.post("/v1/assistant", dependencies=[Depends(require_key)])
+def assistant(body: AssistantIn) -> Dict[str, Any]:
+    """Trả lời một câu hỏi về tài chính của người dùng từ bản tóm tắt họ gửi. Không lưu gì. 503 nếu chưa cấu hình AI."""
+    if not llm.has_key():
+        raise HTTPException(status_code=503, detail="no llm configured")
+    try:
+        answer = llm.assistant_answer(body.question.strip(), body.context)
+    except Exception:
+        raise HTTPException(status_code=502, detail="assistant failed")
+    if not answer:
+        raise HTTPException(status_code=502, detail="assistant failed")
+    return {"answer": answer, "disclaimer": DISCLAIMER}
