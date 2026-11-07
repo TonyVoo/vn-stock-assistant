@@ -10,6 +10,7 @@ import math
 import os
 import re
 import secrets
+import time
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -17,11 +18,12 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from src import data, risk, signals
+from src import data, llm, news, risk, signals
 
 load_dotenv()
 
 DISCLAIMER = "Công cụ hỗ trợ ra quyết định, không phải lời khuyên đầu tư."
+YEAR_SESSIONS = 250
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,10}$")
 
 app = FastAPI(title="VN market service", version="0.1.0")
@@ -57,6 +59,10 @@ def load_prices(symbol: str, days: int) -> tuple[pd.DataFrame, str]:
     df, source = data.get_prices(symbol, days)
     if df is None or df.empty:
         raise HTTPException(status_code=404, detail="no price data")
+    # Giá giả lập chỉ dành cho chế độ thử (DEMO_MODE=1). Nếu không, một mã gõ nhầm sẽ nhận về
+    # cả biểu đồ bịa ra: thà trả "không có dữ liệu" còn hơn đưa số không có thật.
+    if source == "demo" and os.getenv("DEMO_MODE") != "1":
+        raise HTTPException(status_code=404, detail="no price data")
     return df.sort_values("date").reset_index(drop=True), source
 
 
@@ -68,7 +74,9 @@ def health() -> Dict[str, Any]:
 @app.get("/v1/quotes/{symbol}", dependencies=[Depends(require_key)])
 def quote(symbol: str, days: int = Query(default=250, ge=2, le=2500)) -> Dict[str, Any]:
     symbol = clean_symbol(symbol)
-    df, source = load_prices(symbol, days)
+    # Vùng 52 tuần luôn tính trên ~1 năm giá, dù người gọi chỉ xin vài phiên để vẽ.
+    full, source = load_prices(symbol, max(days, YEAR_SESSIONS))
+    df = full.tail(days)
     last = df.iloc[-1]
     prev_close = float(df["close"].iloc[-2]) if len(df) > 1 else None
     close = float(last["close"])
@@ -86,8 +94,8 @@ def quote(symbol: str, days: int = Query(default=250, ge=2, le=2500)) -> Dict[st
         "close": close,
         "prev_close": prev_close,
         "change_pct": change_pct,
-        "high_52w": float(df["close"].tail(250).max()),
-        "low_52w": float(df["close"].tail(250).min()),
+        "high_52w": float(full["close"].tail(YEAR_SESSIONS).max()),
+        "low_52w": float(full["close"].tail(YEAR_SESSIONS).min()),
         "series": series,
     })
 
@@ -128,3 +136,104 @@ def position_size(body: PositionSizeIn) -> Dict[str, Any]:
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
     return finite({"disclaimer": DISCLAIMER, **result})
+
+
+# --- Tin tức và bản tin sáng ---------------------------------------------------------------------------------------
+# Tin lấy từ RSS (chậm, và không nên gọi dồn dập), nên giữ trong bộ nhớ vài phút. Chỉ ghép tin với mã khi tin NHẮC ĐÍCH
+# DANH mã đó (xem news.match_symbol): không đoán tin liên quan.
+
+NEWS_TTL_SECONDS = 10 * 60
+BRIEF_TTL_SECONDS = 30 * 60
+MAX_SYMBOLS = 20
+_cache: Dict[str, tuple[float, Any]] = {}
+
+
+def cached(key: str, ttl: int, load):
+    hit = _cache.get(key)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] < ttl:
+        return hit[1]
+    value = load()
+    _cache[key] = (now, value)
+    return value
+
+
+def clear_cache() -> None:
+    _cache.clear()
+
+
+def symbols_param(raw: str) -> List[str]:
+    """`VNM,FPT` thành danh sách mã đã kiểm tra, không trùng, tối đa MAX_SYMBOLS."""
+    out: List[str] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        symbol = clean_symbol(part)
+        if symbol not in out:
+            out.append(symbol)
+    if not out:
+        raise HTTPException(status_code=422, detail="no symbols")
+    return out[:MAX_SYMBOLS]
+
+
+def feed_items() -> List[Dict[str, Any]]:
+    return cached("feed", NEWS_TTL_SECONDS, lambda: news.fetch_news())
+
+
+@app.get("/v1/news", dependencies=[Depends(require_key)])
+def stock_news(symbols: str = Query(...), limit: int = Query(default=5, ge=1, le=10)) -> Dict[str, Any]:
+    wanted = symbols_param(symbols)
+    items = feed_items()
+    result = []
+    for symbol in wanted:
+        for item in news.match_symbol(items, symbol, limit):
+            result.append({
+                "symbol": symbol,
+                "source": item.get("source", ""),
+                "title": item.get("title", ""),
+                "link": item.get("link", ""),
+                "published": item.get("published", ""),
+            })
+    return {"items": result}
+
+
+@app.get("/v1/brief", dependencies=[Depends(require_key)])
+def morning_brief(symbols: str = Query(...)) -> Dict[str, Any]:
+    """Bản tin sáng do AI viết từ tin tức, thị trường thế giới và điểm kỹ thuật của các mã. 503 nếu chưa cấu hình AI."""
+    wanted = symbols_param(symbols)
+    if not llm.has_key():
+        raise HTTPException(status_code=503, detail="no llm configured")
+
+    def build() -> Dict[str, Any]:
+        watch = []
+        for symbol in wanted:
+            try:
+                df, _ = load_prices(symbol, 400)
+            except HTTPException:
+                continue
+            result = signals.score_stock(df, None)
+            watch.append({"symbol": symbol, "score": result.get("score"), "close": result.get("close"),
+                          "rsi": result.get("rsi"), "warnings": result.get("warnings", [])})
+        raw = llm.morning_brief(news.filter_news(feed_items(), wanted), news.fetch_global_snapshot(), watch)
+        return {
+            "overview": raw.get("tong_quan", ""),
+            "worldLink": raw.get("ket_noi_the_gioi", ""),
+            "topNews": [
+                {"title": n.get("tieu_de", ""), "symbols": n.get("ma_lien_quan", []),
+                 "impact": n.get("tac_dong", "trung_tinh"), "level": n.get("muc_do", "thap"),
+                 "comment": n.get("nhan_xet", "")}
+                for n in raw.get("tin_quan_trong", [])[:6]
+            ],
+            "notes": [{"symbol": n.get("ma", ""), "comment": n.get("nhan_xet", "")} for n in raw.get("luu_y_danh_muc", [])],
+            "risks": list(raw.get("rui_ro_can_theo_doi", [])),
+            "confidence": raw.get("do_tin_cay_du_lieu", ""),
+            "disclaimer": DISCLAIMER,
+        }
+
+    try:
+        return cached("brief:" + ",".join(sorted(wanted)), BRIEF_TTL_SECONDS, build)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail="brief failed")
